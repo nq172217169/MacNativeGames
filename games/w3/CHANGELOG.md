@@ -3,6 +3,25 @@
 Each entry says what was found, what was done and how it was checked. Version 4.04b (update 0100E67012924800 of the
 American release 0100E67012924000: main build ID b151a224…, sdk d5a1029a…; `assets/expected-4.04b.json`).
 
+## 2026-11-24 — the eShop applet crash (Mac)
+
+- **Found**: a windowed session with scripted A/B/A presses ran ~117 s / 3600 frames, then SIGSEGV (signal 0xb,
+  fault 0x0). Symbolising the guest stack from `runtime_tables.h` gave the exact chain:
+  `nn::ec::ShowShopAddOnContentList` (sdk+0x2e8c40) → `ShowShopAddOnContentListImpl` (+0x2eb670) →
+  `nn::ec::detail::ShowShopPage` (+0x2ef470) → `nn::applet::CreateLibraryApplet` (+0x1c5cd0) →
+  `StartLibraryAppletImmediately` (+0x1c62a0), whose `LDR X8,[X0]` read a null `LibraryAppletHandle`. Decoded at
+  +0x1c6430: `0xf9400008` = `ldr x8,[x0]`, x0=0. The game's title/menu eShop (DLC) entry tries to start a shop
+  library applet; the host has no applet proxy, and `CreateLibraryApplet` reported success with an empty handle.
+- **Fix**: as the other ports' `ShowShop` no-ops do, answer "the applet could not start" so the SDK's own failure path
+  returns the player to the menu. The `ShowShop*` entry points are SDK-internal (not in the GOT, so a symbol override
+  cannot reach them), but `nn::applet::CreateLibraryApplet` is a GOT import (kind 1026). `applet_host.c` now overrides
+  it: log the applet id/mode, zero the handle and return a failed `nn::Result` (0xc4400000). W3's software keyboard is
+  its own implementation (`swkbd_host.c`), so no input path depends on this applet.
+- **Checked**: `[totk] CreateLibraryApplet: host stub bound at GOT resolution` at startup confirms the GOT entry resolves
+  to the host stub; 14 W3 unit tests pass; headless and windowed runs pass frame 3900 with no signal. The crash is
+  timing/path dependent and was not re-triggered in the verification runs, so the stub is verified at the binding
+  level, not by reproducing the original crash.
+
 ## 2026-11-24 — macOS 27: the 48 GiB VAMM region above the 39-bit line (Mac)
 
 - **Startup crash**: `main`+0x5d70's constructor called `AllocateAddressRegion(0xc00000000)`, but macOS 27 leaves only

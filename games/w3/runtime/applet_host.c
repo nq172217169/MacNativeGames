@@ -102,8 +102,24 @@ static void default_display_resolution(int *w, int *h) { if (w) *w = 1920; if (h
 static void default_display_resolution_event(void *event) { if (!event) runtime_fail("display resolution event"); hle_bind_system_event(event, 0); }
 static void restart_program(const void *argument, uint64_t size) { (void)argument; (void)size; runtime_fail("the game asked to restart (nn::oe::RestartProgram): start it again"); }
 
+/* The host has no library-applet proxy. Without an override the SDK's CreateLibraryApplet talks to an am session that
+   was never opened: it reports success with an empty handle, and nn::applet::StartLibraryAppletImmediately then reads
+   through that null handle (sdk+0x1c6430, LDR X8,[X0]). W3 reaches it from the title/menu's eShop entry
+   (nn::ec::ShowShopAddOnContentList -> ShowShopPage -> CreateLibraryApplet). Answer "the applet could not start" so
+   the SDK's own failure path returns the player to the menu, as the ShowShop no-ops do in the other ports. W3 has its
+   own software-keyboard implementation (swkbd_host.c), so no keyboard path depends on this applet. */
+#define APPLET_RESULT_FAIL 0xc4400000u   /* am module, bit31 set: a failed nn::Result */
+static uint32_t create_library_applet(void *out_handle, uint32_t applet_id, uint32_t mode) {
+    if (out_handle) *(uint64_t *)out_handle = 0;
+    fprintf(stderr, "[totk] library applet id=%#x mode=%#x: no applet proxy on the host, reported failed\n",
+            applet_id, mode);
+    return APPLET_RESULT_FAIL;
+}
+
 void *runtime_applet_override(const char *name) {
     static const struct { const char *name; void *fn; } map[] = {
+        {"_ZN2nn6applet19CreateLibraryAppletEPNS0_19LibraryAppletHandleENS0_8AppletIdENS0_17LibraryAppletModeE", create_library_applet},
+
         {"_ZN2nn6applet23GetPreviousProgramIndexEv", previous_program_index},
         {"_ZN2nn6applet23GetAppletResourceUserIdEv", applet_resource_user_id},
         {"_ZN2nn2am23GetAppletResourceUserIdEv", applet_resource_user_id},
@@ -133,6 +149,11 @@ void *runtime_applet_override(const char *name) {
         {"_ZN2nn3err9ShowErrorENS_6ResultE", show_error},
         {"_ZN2nn3web19ShowOfflineHtmlPageEPNS0_26OfflineHtmlPageReturnValueERKNS0_22ShowOfflineHtmlPageArgE", show_offline_html_page},
     };
-    for (size_t i = 0; i < sizeof map / sizeof *map; i++) if (!strcmp(name, map[i].name)) return map[i].fn;
+    for (size_t i = 0; i < sizeof map / sizeof *map; i++) if (!strcmp(name, map[i].name)) {
+        static int create_reported;
+        if (map[i].fn == (void *)create_library_applet && !create_reported)
+            { create_reported = 1; fprintf(stderr, "[totk] CreateLibraryApplet: host stub bound at GOT resolution\n"); }
+        return map[i].fn;
+    }
     return NULL;
 }
