@@ -37,6 +37,21 @@ static uint64_t alias_len;
 static uint64_t alias_requested(void){const char *e=getenv("TOTK_ALIAS_GIB");uint64_t g=e?strtoull(e,NULL,0):ALIAS_DEFAULT_GIB;if(g<1||g>64)runtime_fail("TOTK_ALIAS_GIB must be 1..64");return g<<30;}
 static uint64_t alias_size(void){if(!alias_len)alias_len=alias_requested();return alias_len;}
 #define ALIAS_SIZE alias_size()
+/* The Witcher 3's main-module constructor asks AllocateAddressRegion for 48 GiB (0xc00000000), far more than the
+   ~39 GiB of fragmented free space macOS 27 leaves below 2^39. Its VAMM region is real RAM on the Switch (the
+   VammManager keeps its books in user mode and AllocateMemoryPages only tags attributes), so host it above the
+   39-bit line, where 64 GiB is available at 0x100_0000_0000 (the same layout games/pla uses). The guest's stack,
+   heap and alias region keep their normal addresses below 2^39: only VAMM pages get the high addresses. */
+#define VAMM_FIXED_AT 0x10000000000ULL
+#define VAMM_SIZE_MAX (64ULL<<30)
+#define VAMM_SIZE_WANT VAMM_SIZE_MAX
+static uint8_t *vamm_space;
+static uint64_t vamm_size = VAMM_SIZE_WANT;
+#define VAMM_SPACE_AT ((uint64_t)(uintptr_t)vamm_space)
+#define VAMM_SIZE vamm_size
+#define VAMM_PAGES (VAMM_SIZE_MAX/4096)
+static unsigned char vamm_pages[VAMM_PAGES];   /* per-4 KiB page physical-commit state */
+static uint64_t vamm_bytes;
 #define LOW_SEARCH_FROM 0x300000000ULL
 #if TARGET_OS_IPHONE
 #define LOW_SIZE (HEAP_OFF+HEAP_CAP)   /* iOS: no slack after the heap cap; address space is scarce */
@@ -65,6 +80,11 @@ static uint8_t user_exception_context[0x1000] __attribute__((aligned(0x1000)));
 #define APP_POOL app_pool()
 static uint64_t app_pool(void){static uint64_t v;if(!v){const char *e=getenv("TOTK_APP_POOL");uint64_t extra=(runtime_output_res_extra_bytes()+runtime_render_pool_extra()+0x1fffff)&~0x1fffffULL;
  v=e?strtoull(e,NULL,0):0xcd500000ULL+extra;if(!e&&extra)fprintf(stderr,"[totk] application pool %#llx: +%llu MiB for the bigger texture heaps (TOTK_OUTPUT_RES, TOTK_RENDER_RES)\n",(unsigned long long)v,(unsigned long long)(extra>>20));}return v;}
+/* The VAMM reservation is lazily committed anonymous memory: only the pages the game actually touches become
+   resident. Book its physical-memory calls against a wide budget so the 48 GiB address region does not make
+   MapPhysicalMemory fail before the game has mapped the few GiB it really uses. The game still plans heap commits
+   against APP_POOL (GetInfo 6/21), which is unchanged. */
+#define APP_POOL_CHECK (16ULL<<30)
 /* TOTK: application memory pool reported to the game (default: retail 3.2 GiB; TOTK_OUTPUT_RES adds what its HeapDef overlay gives the texture heaps) */
 #define ALIAS_START ((uintptr_t)alias_space)
 #define STACK_START ((uintptr_t)low_space+STACK_OFF)
@@ -124,7 +144,19 @@ static void memory_init(void) {
  }
 #endif
  heap=low_space+HEAP_OFF;
- fprintf(stderr,"[totk] guest layout: alias %#llx+%#llx stack %#llx+%#llx heap %#llx (cap %#llx)\n",(unsigned long long)ALIAS_START,ALIAS_SIZE,(unsigned long long)STACK_START,STACK_SIZE,(unsigned long long)(uintptr_t)heap,HEAP_CAP);
+ if(!vamm_space){
+  mach_vm_address_t a=TARGET_OS_IPHONE?0:VAMM_FIXED_AT;
+  vamm_space=mach_vm_map(mach_task_self(),&a,VAMM_SIZE,0,TARGET_OS_IPHONE?VM_FLAGS_ANYWHERE:VM_FLAGS_FIXED,MEMORY_OBJECT_NULL,0,FALSE,VM_PROT_READ|VM_PROT_WRITE,VM_PROT_ALL,VM_INHERIT_DEFAULT)==KERN_SUCCESS?(uint8_t *)(uintptr_t)a:NULL;
+ }
+ if(!vamm_space)runtime_fail(TARGET_OS_IPHONE?"reserve the 64 GiB VAMM region":"reserve the 64 GiB VAMM region at 0x10000000000");
+ fprintf(stderr,"[totk] guest layout: alias %#llx+%#llx stack %#llx+%#llx heap %#llx (cap %#llx) vamm %#llx+%#llx\n",(unsigned long long)ALIAS_START,ALIAS_SIZE,(unsigned long long)STACK_START,STACK_SIZE,(unsigned long long)(uintptr_t)heap,HEAP_CAP,(unsigned long long)VAMM_SPACE_AT,VAMM_SIZE);
+}
+/* HIPC descriptors carry only 39 address bits. The VAMM region lives above that line, so the SDK sends its low mirror;
+   give those addresses their high bits back before the host reads an IPC buffer (audio buffers, 2026-11-24). */
+uint64_t runtime_ipc_address(uint64_t a){
+ if(vamm_space){uint64_t lo=VAMM_SPACE_AT&(GUEST_ADDRESS_LIMIT-1);
+  if(a>=lo&&a<lo+VAMM_SIZE)return a+(VAMM_SPACE_AT-lo);}
+ return a;
 }
 /* Scoped stack moves: independent host backing, copy back on unmap.
  * Logical accounting is 4 KiB; Darwin protections are rounded to 16 KiB.
@@ -137,14 +169,16 @@ static uint64_t stack_move(int unmap,uint64_t dst,uint64_t src,uint64_t size){
  if(!size||((dst|src|size)&4095))return 0xcc01;
  if(dst<STACK_START||size>STACK_SIZE||dst-STACK_START>STACK_SIZE-size)return 0xdc01;
  int inHeap=src>=(uintptr_t)heap&&size<=heap_size&&src-(uintptr_t)heap<=heap_size-size;
- uint64_t aliasStart=ALIAS_START;
+ uint64_t aliasStart=ALIAS_START,vammStart=VAMM_SPACE_AT;
  int inAlias=src>=aliasStart&&size<=ALIAS_SIZE&&src-aliasStart<=ALIAS_SIZE-size;
+ int inVamm=src>=vammStart&&size<=VAMM_SIZE&&src-vammStart<=VAMM_SIZE-size;
  /* A module's data or .bss is a valid source too (CodeData): Red Dead Redemption keeps thread stacks in main's .bss, as
     Metroid Dread does (games/dread's rule). */
- int inModule=!inHeap&&!inAlias&&runtime_module_data_rw(src,size);
- if(!inHeap&&!inAlias&&!inModule)return 0xdc01;
+ int inModule=!inHeap&&!inAlias&&!inVamm&&runtime_module_data_rw(src,size);
+ if(!inHeap&&!inAlias&&!inVamm&&!inModule)return 0xdc01;
  pthread_mutex_lock(&memory_lock);
  if(inAlias){unsigned first=(unsigned)((src-aliasStart)/4096);for(uint64_t i=0;i<size/4096;i++)if(!alias_pages[first+i]){pthread_mutex_unlock(&memory_lock);return 0xdc01;}}
+ if(inVamm){unsigned first=(unsigned)((src-vammStart)/4096);for(uint64_t i=0;i<size/4096;i++)if(!vamm_pages[first+i]){pthread_mutex_unlock(&memory_lock);return 0xdc01;}}
 
  unsigned found=nstack_maps;for(unsigned i=0;i<nstack_maps;i++)if(stack_maps[i].dst==dst&&stack_maps[i].src==src&&stack_maps[i].size==size)found=i;
  uint64_t lo=dst&~0x3fffULL,hi=(dst+size+0x3fff)&~0x3fffULL;
@@ -153,12 +187,14 @@ static uint64_t stack_move(int unmap,uint64_t dst,uint64_t src,uint64_t size){
   if(found==nstack_maps){pthread_mutex_unlock(&memory_lock);return 0xd401;}
   if(shi>slo&&mprotect((void *)slo,shi-slo,PROT_READ|PROT_WRITE))runtime_fail("restore moved stack source");
   memcpy((void *)src,(const void *)dst,size);stack_maps[found]=stack_maps[--nstack_maps];
+  if(inVamm){unsigned first=(unsigned)((src-vammStart)/4096);for(uint64_t i=0;i<size/4096;i++)if(!vamm_pages[first+i]){vamm_pages[first+i]=1;vamm_bytes+=4096;}}
   for(uint64_t page=lo;page<hi;page+=0x4000){int used=0;for(unsigned i=0;i<nstack_maps;i++)if(overlaps(page,0x4000,stack_maps[i].dst,stack_maps[i].size))used=1;
    if(!used&&mprotect((void *)page,0x4000,PROT_NONE))runtime_fail("decommit moved stack");}
  }else{
   if(nstack_maps==4096){pthread_mutex_unlock(&memory_lock);return 0xd401;}
   for(unsigned i=0;i<nstack_maps;i++)if(overlaps(dst,size,stack_maps[i].dst,stack_maps[i].size)||overlaps(src,size,stack_maps[i].src,stack_maps[i].size)){pthread_mutex_unlock(&memory_lock);return 0xdc01;}
   if(mprotect((void *)lo,hi-lo,PROT_READ|PROT_WRITE))runtime_fail("commit moved stack");memcpy((void *)dst,(const void *)src,size);
+  if(inVamm){unsigned first=(unsigned)((src-vammStart)/4096);for(uint64_t i=0;i<size/4096;i++)if(!vamm_pages[first+i]){vamm_pages[first+i]=1;vamm_bytes+=4096;}}
   if(shi>slo&&mprotect((void *)slo,shi-slo,PROT_NONE))runtime_fail("protect moved stack source");
   stack_maps[nstack_maps++]=(StackMap){dst,src,size,inModule?4u:5u};
  }
@@ -197,10 +233,29 @@ static uint64_t alias_map(int unmap,uint64_t addr,uint64_t size){
  }
  pthread_mutex_unlock(&memory_lock);return 0;
 }
+/* MapPhysicalMemory/UnmapPhysicalMemory over the VAMM region above 2^39. The reservation is anonymous memory and
+   committing is mprotect; unmap only updates the bookkeeping (the host keeps pages committed, as games/pla does,
+   because the Witcher 3 allocator reuses pages through stale mappings). */
+static uint64_t vamm_map(int unmap,uint64_t addr,uint64_t size){
+ uint64_t start=VAMM_SPACE_AT;
+ if(!size||((addr|size)&4095))return 0xcc01;
+ if(addr<start||size>VAMM_SIZE||addr-start>VAMM_SIZE-size)return 0xdc01;
+ pthread_mutex_lock(&memory_lock);unsigned first=(unsigned)((addr-start)/4096),count=(unsigned)(size/4096);
+ uint64_t fresh=0;if(!unmap)for(unsigned i=0;i<count;i++)if(!vamm_pages[first+i])fresh+=4096;
+ if(!unmap&&fresh+alias_bytes+heap_size+runtime_image_bytes()+vamm_bytes>APP_POOL_CHECK){
+  pthread_mutex_unlock(&memory_lock);return 0x10801;
+ }
+ if(!unmap){
+  uint64_t low=addr&~0x3fffULL,high=(addr+size+0x3fff)&~0x3fffULL;
+  if(mprotect((void *)low,high-low,PROT_READ|PROT_WRITE))runtime_fail("commit physical VAMM pages");
+  for(unsigned i=0;i<count;i++)if(!vamm_pages[first+i]){vamm_pages[first+i]=1;vamm_bytes+=4096;}
+ }
+ pthread_mutex_unlock(&memory_lock);return 0;
+}
 uint64_t runtime_heap_base(void){return (uintptr_t)heap;}
 void runtime_heap_range(uint8_t **base,size_t *size){*base=heap;*size=heap_size;}   /* key 4: the camera projection search (odyssey_aspect.c) */
 /* Guest memory the game has committed (heap size + mapped alias pages), for memory reports (iOS app monitor). */
-void runtime_guest_committed(uint64_t *heap_bytes,uint64_t *alias_mapped){*heap_bytes=heap_size;*alias_mapped=alias_bytes;}
+void runtime_guest_committed(uint64_t *heap_bytes,uint64_t *alias_mapped){*heap_bytes=heap_size;*alias_mapped=alias_bytes+vamm_bytes;}
 /* Physical memory behind the guest regions (stack+heap and alias): resident pages, of which dirty, and pages the system
    compressed. Committed sizes overstate what the game uses; these are what count against the iOS memory limit. */
 static void region_pages(uint64_t a,uint64_t end,uint64_t *resident,uint64_t *dirty,uint64_t *compressed){
@@ -213,6 +268,7 @@ void runtime_guest_resident(uint64_t *resident,uint64_t *dirty,uint64_t *compres
  *resident=*dirty=*compressed=0;if(!low_space)return;
  region_pages((uintptr_t)low_space,(uintptr_t)low_space+LOW_SIZE,resident,dirty,compressed);
  region_pages(ALIAS_START,ALIAS_START+ALIAS_SIZE,resident,dirty,compressed);
+ if(vamm_space)region_pages(VAMM_SPACE_AT,VAMM_SPACE_AT+VAMM_SIZE,resident,dirty,compressed);
 }
 static void host_diag_init(void) { fprintf(stderr,"[totk] native diagnostics initialized\n"); }
 static void host_oe_init(void) { fprintf(stderr,"[totk] application environment: local macOS process\n"); }
@@ -368,13 +424,19 @@ uint64_t runtime_svc(unsigned num,uint64_t *r,const char *module,uint64_t offset
  if(runtime_ipc_svc(num,r))return r[0];
  memory_init();
  switch(num) {
- case 0x02:r[0]=runtime_module_permission(r[0],r[1],(unsigned)r[2]);return r[0];
- case 0x03:r[0]=runtime_module_lock_permission(r[0],r[1],(unsigned)r[2],(unsigned)r[3]);return r[0];
+ case 0x02:{
+  uint64_t a=r[0],s=r[1];
+  if(vamm_space&&s&&a>=VAMM_SPACE_AT&&s<=VAMM_SIZE&&a+s<=VAMM_SPACE_AT+VAMM_SIZE)return r[0]=0;
+  r[0]=runtime_module_permission(a,s,(unsigned)r[2]);return r[0];}
+ case 0x03:{
+  uint64_t a=r[0],s=r[1];
+  if(vamm_space&&s&&a>=VAMM_SPACE_AT&&s<=VAMM_SIZE&&a+s<=VAMM_SPACE_AT+VAMM_SIZE)return r[0]=0;
+  r[0]=runtime_module_lock_permission(a,s,(unsigned)r[2],(unsigned)r[3]);return r[0];}
  case 0x29: {
   uint64_t value=0;unsigned id=(unsigned)r[1];
   switch(id) {
   case 0:value=7;break;case 1:value=0x0ffffffff0000000ULL;break;
-  case 2:value=ALIAS_START;break;case 3:value=ALIAS_SIZE;break;
+  case 2:value=VAMM_SPACE_AT;break;case 3:value=VAMM_SIZE;break;
   case 4:value=(uintptr_t)heap;break;case 5:value=HEAP_CAP;break;
   case 6:case 21:value=APP_POOL;break;case 7:case 22:value=runtime_image_bytes()+heap_size+alias_bytes;
    { static unsigned polls; if(getenv("TOTK_MEM_LOG")&&(polls++%600)==0) fprintf(stderr,"[totk-mem] GetInfo(%u) total=%#llx used=%#llx image=%#llx heap=%#llx alias=%#llx\n",id,(unsigned long long)APP_POOL,(unsigned long long)value,(unsigned long long)runtime_image_bytes(),(unsigned long long)heap_size,(unsigned long long)alias_bytes); }
@@ -383,7 +445,7 @@ uint64_t runtime_svc(unsigned num,uint64_t *r,const char *module,uint64_t offset
   case 11:arc4random_buf(&value,8);break;
   case 12:value=ASLR_START;break;case 13:value=ASLR_SIZE;break;
   case 14:value=STACK_START;break;case 15:value=STACK_SIZE;break;
-  case 16:value=SYSTEM_RESOURCE_BUDGET;break;case 17:value=sizeof(stack_maps)+sizeof(alias_pages);break;case 18:value=GAME_TITLE_ID;break;
+  case 16:value=SYSTEM_RESOURCE_BUDGET;break;case 17:value=sizeof(stack_maps)+sizeof(alias_pages)+sizeof(vamm_pages);break;case 18:value=GAME_TITLE_ID;break;
   case 20:value=(uintptr_t)user_exception_context;break;   /* UserExceptionContextAddress: SDK stores e.g. the dying-message region at +0x1c0 */case 23:value=1;break;
   /* AliasRegionExtraSize (18.0.0+): our alias reservation contains no
    * kernel-owned extension outside the range reported by ids 2 and 3. */
@@ -392,9 +454,10 @@ uint64_t runtime_svc(unsigned num,uint64_t *r,const char *module,uint64_t offset
   }
   r[0]=0;r[1]=value;return 0;
  }
- case 0x2c:case 0x2d:{uint64_t a=r[0],n=r[1];r[0]=alias_map(num==0x2d,a,n);
-  if(getenv("TOTK_MEM_LOG"))fprintf(stderr,"[totk-mem] %sMapPhysicalMemory %#llx+%#llx -> %#llx alias=%#llx remaining=%#llx\n",num==0x2d?"Un":"",(unsigned long long)a,(unsigned long long)n,(unsigned long long)r[0],(unsigned long long)alias_bytes,(unsigned long long)(APP_POOL-runtime_image_bytes()-heap_size-alias_bytes));
-  if(r[0])fprintf(stderr,"[totk] %sMapPhysicalMemory %#llx+%#llx failed %#llx (alias %#llx used, heap %#llx)\n",num==0x2d?"Un":"",(unsigned long long)a,(unsigned long long)n,(unsigned long long)r[0],(unsigned long long)alias_bytes,(unsigned long long)heap_size);return r[0];}
+ case 0x2c:case 0x2d:{uint64_t a=r[0],n=r[1];
+  r[0]=(vamm_space&&a>=VAMM_SPACE_AT&&a<VAMM_SPACE_AT+VAMM_SIZE)?vamm_map(num==0x2d,a,n):alias_map(num==0x2d,a,n);
+  if(getenv("TOTK_MEM_LOG"))fprintf(stderr,"[totk-mem] %sMapPhysicalMemory %#llx+%#llx -> %#llx alias=%#llx vamm=%#llx remaining=%#llx\n",num==0x2d?"Un":"",(unsigned long long)a,(unsigned long long)n,(unsigned long long)r[0],(unsigned long long)alias_bytes,(unsigned long long)vamm_bytes,(unsigned long long)(APP_POOL_CHECK-runtime_image_bytes()-heap_size-alias_bytes-vamm_bytes));
+  if(r[0])fprintf(stderr,"[totk] %sMapPhysicalMemory %#llx+%#llx failed %#llx (alias %#llx vamm %#llx used, heap %#llx)\n",num==0x2d?"Un":"",(unsigned long long)a,(unsigned long long)n,(unsigned long long)r[0],(unsigned long long)alias_bytes,(unsigned long long)vamm_bytes,(unsigned long long)heap_size);return r[0];}
  case 0x04:case 0x05:r[0]=stack_move(num==5,r[0],r[1],r[2]);return r[0];
  case 0x06: {
   uint64_t addr=r[2],base=addr&~0xfffULL,size=0x1000;unsigned state=0,perm=0,attr=0;
@@ -411,6 +474,11 @@ uint64_t runtime_svc(unsigned num,uint64_t *r,const char *module,uint64_t offset
    unsigned p=(unsigned)((addr-ALIAS_START)/4096),low=p,high=p+1;unsigned allocated=alias_pages[p];
    while(low>0&&alias_pages[low-1]==allocated)low--;while(high<sizeof(alias_pages)&&alias_pages[high]==allocated)high++;
    base=ALIAS_START+(uint64_t)low*4096;size=(uint64_t)(high-low)*4096;state=allocated?5:0;perm=allocated?3:0;
+  }
+  if(vamm_space&&addr>=VAMM_SPACE_AT&&addr<VAMM_SPACE_AT+VAMM_SIZE){
+   unsigned p=(unsigned)((addr-VAMM_SPACE_AT)/4096),low=p,high=p+1;unsigned allocated=vamm_pages[p];
+   while(low>0&&vamm_pages[low-1]==allocated)low--;while(high<VAMM_PAGES&&vamm_pages[high]==allocated)high++;
+   base=VAMM_SPACE_AT+(uint64_t)low*4096;size=(uint64_t)(high-low)*4096;state=allocated?5:0;perm=allocated?3:0;
   }
   for(unsigned i=0;i<nstack_maps;i++){
    StackMap *m=&stack_maps[i];uint64_t end=m->dst+m->size,send=m->src+m->size;

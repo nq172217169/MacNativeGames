@@ -3,6 +3,24 @@
 Each entry says what was found, what was done and how it was checked. Version 4.04b (update 0100E67012924800 of the
 American release 0100E67012924000: main build ID b151a224…, sdk d5a1029a…; `assets/expected-4.04b.json`).
 
+## 2026-11-24 — macOS 27: the 48 GiB VAMM region above the 39-bit line (Mac)
+
+- **Startup crash**: `main`+0x5d70's constructor called `AllocateAddressRegion(0xc00000000)`, but macOS 27 leaves only
+  9 + 10 + 20 GiB of fragmented free space below 2^39. The SDK returned 0x1803, then `AllocateMemoryPages(NULL)` 0xe03
+  and SIGTRAP before the first frame; shrinking the request only moved the crash to the game's own 48 GiB address
+  arithmetic (`AllocateMemoryPages(0x7c40000000, 0x6e900000)`). Clamping the SDK result is not enough.
+- **Fix**: as `games/pla` does for its 32 GiB region, host this game's VAMM region above the 39-bit line as a 64 GiB
+  lazy-commit mapping at 0x100_0000_0000. `GetInfo(2/3)` now reports VAMM, not the small alias region;
+  `MapPhysicalMemory`, `QueryMemory`, permission ops and scoped-stack sources route VAMM addresses to the new
+  `vamm_map`/`vamm_pages`, while stack, heap and alias keep their normal low addresses. Physical-memory calls book
+  against a wide lazy-commit budget (16 GiB); heap commits still use the retail pool (`GetInfo(6/21)`).
+- **IPC**: HIPC descriptors carry only 39 address bits, so an audio buffer in VAMM reached the host as 0x690000000
+  and faulted. `shared/runtime/ipc.c` now has a weak `runtime_ipc_address` hook (identity by default, so other
+  games are unchanged); W3's strong hook restores the high bits of addresses in the VAMM mirror window.
+- **Checked**: the constructor gets `AllocateAddressRegion size=c00000000 result=0 address=10040000000`, reaches the
+  title/menu, and runs 600 frames at frame p50 33.33 ms / p95 33.52 ms (GPU p50 0.41 ms) with no SIGTRAP/SIGBUS,
+  no failed `AllocateMemoryPages`/`MapPhysicalMemory`; 14 W3 unit tests pass.
+
 ## 2026-11-23 — from nothing to the first in-engine scene (Mac)
 
 - **Inputs**: the player's base NSP (3.7) and 4.04b update; the update's ExeFS (games/pla `extract_exefs.py`), the merged

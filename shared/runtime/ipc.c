@@ -94,8 +94,12 @@ _Noreturn void ipc_unimplemented(const IpcSession *s, const IpcRequest *rq) {
 }
 
 /* ---------- HIPC framing ---------- */
-static uint64_t static_addr(const uint32_t *d) { return d[1] | ((uint64_t)((d[0] >> 12) & 0xf) << 32) | ((uint64_t)((d[0] >> 6) & 0x3f) << 36); }
-static uint64_t buffer_addr(const uint32_t *d) { return d[1] | ((uint64_t)((d[2] >> 28) & 0xf) << 32) | ((uint64_t)((d[2] >> 2) & 0x3fffff) << 36); }
+/* A game whose guest memory lives above 2^39 defines this to give a truncated descriptor address its high bits back.
+   The default is identity, so every other game keeps the exact framing it had. */
+uint64_t runtime_ipc_address(uint64_t a) __attribute__((weak));
+uint64_t runtime_ipc_address(uint64_t a) { return a; }
+static uint64_t static_addr(const uint32_t *d) { return runtime_ipc_address(d[1] | ((uint64_t)((d[0] >> 12) & 0xf) << 32) | ((uint64_t)((d[0] >> 6) & 0x3f) << 36)); }
+static uint64_t buffer_addr(const uint32_t *d) { return runtime_ipc_address(d[1] | ((uint64_t)((d[2] >> 28) & 0xf) << 32) | ((uint64_t)((d[2] >> 2) & 0x3fffff) << 36)); }
 static uint64_t buffer_size(const uint32_t *d) { return d[0] | ((uint64_t)((d[2] >> 24) & 0xf) << 32); }
 
 static void parse(const uint32_t *m, IpcRequest *rq, const uint32_t **data_words, unsigned *ndata) {
