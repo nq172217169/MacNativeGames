@@ -3,6 +3,18 @@
 Each entry says what was found, what was done and how it was checked. Version 4.04b (update 0100E67012924800 of the
 American release 0100E67012924000: main build ID b151a224…, sdk d5a1029a…; `assets/expected-4.04b.json`).
 
+## 2026-11-24 — self-contained app (Mac)
+
+- **Found**: the first `The Witcher 3.app` was a launcher shell over the external `~/w3_local` work folder
+  (`MNGWorkFolder` in Info.plist), so Finder and Storage reported ~1.8 MB for the app while the game's 20 GB of data
+  lived outside it — unlike the other ports, whose apps carry the game files.
+- **Fix**: `scripts/package_app.py` now APFS-clones the runtime, `rewritten/local` and the three RomFS files into
+  `Contents/Resources/game` (zero extra space on the same volume); `app/launcher.c` finds that folder from its own
+  executable path and chdirs there, instead of reading `MNGWorkFolder`. Player saves/cache stay in
+  `~/Library/Application Support/MacNativeGames/W3`, so the app is self-contained but the save folder is unaffected.
+- **Checked**: a 20 GB `cp -c` completed in 0.002 s with ~48 KB of metadata used; app builds to ~20 GB, passes
+  `codesign --verify --deep --strict` and `--check`, and launches to the title from Finder.
+
 ## 2026-11-24 — the eShop applet crash (Mac)
 
 - **Found**: a windowed session with scripted A/B/A presses ran ~117 s / 3600 frames, then SIGSEGV (signal 0xb,

@@ -1,9 +1,11 @@
-/* The Witcher 3.app launcher. The game's 20 GB work folder stays outside the app (MNGWorkFolder in Info.plist);
-   this launcher reads it, points the runtime at the player's data folder, and runs build/w3-native from that folder
-   (the runtime resolves rewritten/local and extracted/local/romfs relative to its cwd, see loader.c and romfs.c).
+/* The Witcher 3.app launcher: points the runtime at the game files bundled in this app and the player's data folder,
+   then runs it. The runtime resolves rewritten/local and extracted/local/romfs relative to its cwd (loader.c, romfs.c),
+   so this launcher chdirs to Contents/Resources/game, which mirrors the work folder's layout.
 
-   Data: ~/Library/Application Support/MacNativeGames/W3 (W3_DATA_DIR overrides): profile/ (saves), shader-cache/,
-   game-slot/, commands.txt, last-run.log. The GPU switches and guard settings match games/w3/README.md. */
+   App:    Contents/MacOS/W3 (this); Contents/Resources/game/{build/w3-native, rewritten/local,
+           extracted/local/romfs/{index.json, runtime-index.bin, romfs.bin}} (scripts/package_app.py).
+   Data:   ~/Library/Application Support/MacNativeGames/W3 (W3_DATA_DIR overrides): profile/ (saves), shader-cache/,
+           game-slot/, commands.txt, last-run.log. The GPU switches follow games/w3/README.md. */
 #include <errno.h>
 #include <fcntl.h>
 #include <libgen.h>
@@ -21,30 +23,18 @@ static void join(char *out, const char *dir, const char *name) {
     if (snprintf(out, PATH_MAX, "%s/%s", dir, name) >= PATH_MAX) { fputs("path too long\n", stderr); exit(1); }
 }
 
-/* Read a string value from this app's Info.plist. Info.plist is XML written by plistlib (bundle.write_info): find
-   <key>K</key> then the next <string>...</string>. Reading the file directly works even while the app is staged as
-   <name>.app.partial, which has no bundle extension for CFBundle to recognise. */
-static int info_string(const char *key, char *out, size_t n) {
+/* Locate Contents/Resources/game from this executable's real path (works for a staged .app.partial too). */
+static int find_game(char *game, size_t n) {
     char exe[PATH_MAX], real[PATH_MAX];
     uint32_t size = sizeof exe;
     if (_NSGetExecutablePath(exe, &size) || !realpath(exe, real)) return -1;
-    char contents[PATH_MAX]; snprintf(contents, sizeof contents, "%s", real);
-    char *macos = dirname(contents);                 /* .../Contents/MacOS */
-    char *p = dirname(macos);                        /* .../Contents */
-    char plist[PATH_MAX]; join(plist, p, "Info.plist");
-    int fd = open(plist, O_RDONLY);
-    if (fd < 0) return -1;
-    static char buf[1 << 16]; ssize_t got = read(fd, buf, sizeof buf - 1); close(fd);
-    if (got <= 0) return -1; buf[got] = 0;
-    char tag[256]; snprintf(tag, sizeof tag, "<key>%s</key>", key);
-    char *at = strstr(buf, tag);
-    if (!at) return -1;
-    char *s = strstr(at + strlen(tag), "<string>");
-    if (!s) return -1;
-    s += strlen("<string>");
-    char *e = strstr(s, "</string>");
-    if (!e || (size_t)(e - s) >= n) return -1;
-    memcpy(out, s, e - s); out[e - s] = 0;
+    char *macos = dirname(real);                       /* .../Contents/MacOS */
+    char *contents = dirname(macos);                   /* .../Contents */
+    char tmp[PATH_MAX];
+    join(tmp, contents, "Resources");
+    char game_path[PATH_MAX]; join(game_path, tmp, "game");
+    if (realpath(game_path, game) == NULL) return -1;
+    (void)n;
     return 0;
 }
 
@@ -52,13 +42,13 @@ int main(int argc, char **argv) {
     int check = argc == 2 && !strcmp(argv[1], "--check");
     if (argc != 1 && !check) { fprintf(stderr, "usage: %s [--check]\n", NAME); return 2; }
 
-    char work[PATH_MAX];
-    if (info_string("MNGWorkFolder", work, sizeof work)) { fprintf(stderr, NAME ": no MNGWorkFolder in Info.plist\n"); return 1; }
+    char game[PATH_MAX];
+    if (find_game(game, sizeof game)) { fprintf(stderr, NAME ": bundled game data not found in this app\n"); return 1; }
     char runtime[PATH_MAX], modules[PATH_MAX], main_module[PATH_MAX], romfs[PATH_MAX];
-    join(runtime, work, "build/w3-native");
-    join(modules, work, "rewritten/local");
+    join(runtime, game, "build/w3-native");
+    join(modules, game, "rewritten/local");
     join(main_module, modules, "main.patched.bin");
-    join(romfs, work, "extracted/local/romfs");
+    join(romfs, game, "extracted/local/romfs");
     if (access(runtime, X_OK)) { perror(NAME ": missing runtime"); return 1; }
     if (access(main_module, R_OK)) { perror(NAME ": missing game data"); return 1; }
     if (check) { puts(NAME " launcher: runtime and game data present; game was not launched"); return 0; }
@@ -96,8 +86,8 @@ int main(int argc, char **argv) {
     for (const char *const *v = (const char *const[]){"TOTK_HEADLESS", "TOTK_INPUT_SCRIPT", "TOTK_AUTOLOAD", NULL}; *v; v++)
         unsetenv(*v);
 
-    /* The runtime resolves modules and RomFS relative to cwd: run from the work folder. */
-    if (chdir(work)) { perror(NAME ": chdir work folder"); return 1; }
+    /* The runtime resolves modules and RomFS relative to cwd: run from the bundled game folder. */
+    if (chdir(game)) { perror(NAME ": chdir bundled game folder"); return 1; }
     char previous[PATH_MAX]; join(previous, data, "previous-run.log");
     rename(log, previous);
     int fd = open(log, O_WRONLY | O_CREAT | O_TRUNC, 0644);
