@@ -34,9 +34,13 @@ def require(condition, message):
 
 def verify(work):
     """What the app carries, checked: {name: path}."""
-    files = {'runtime': work / 'build/w3-native'}
-    require(files['runtime'].is_file() and os.access(files['runtime'], os.X_OK),
-            f'no runtime: run make runtime ({files["runtime"]})')
+    files = {
+        'runtime': work / 'build/w3-native',
+        'translator': work / 'build/shader-service/totk_xlate',
+        'spirv-cross': work / 'build/spirv-cross/spirv-cross',
+    }
+    for name, path in files.items():
+        require(path.is_file() and os.access(path, os.X_OK), f'no {name}: run make ({path})')
     modules = work / 'rewritten/local'
     for name in ('main.patched.bin', 'sdk.patched.bin'):
         require((modules / name).is_file(), f'missing game module: {modules / name} (run make prepare)')
@@ -70,6 +74,8 @@ def assemble(stage, files, icon, record):
     game = contents / 'Resources/game'
     macos.mkdir(parents=True)
     bundle.clone_file(files['runtime'], game / 'build/w3-native')
+    bundle.clone_file(files['translator'], game / 'build/shader-service/totk_xlate')
+    bundle.clone_file(files['spirv-cross'], game / 'build/spirv-cross/spirv-cross')
     bundle.clone_tree(files['modules'], game / 'rewritten/local')
     for name in ROMFS_FILES:
         bundle.clone_file(files['romfs'] / name, game / 'extracted/local/romfs' / name)

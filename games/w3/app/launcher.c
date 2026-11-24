@@ -2,7 +2,8 @@
    then runs it. The runtime resolves rewritten/local and extracted/local/romfs relative to its cwd (loader.c, romfs.c),
    so this launcher chdirs to Contents/Resources/game, which mirrors the work folder's layout.
 
-   App:    Contents/MacOS/W3 (this); Contents/Resources/game/{build/w3-native, rewritten/local,
+   App:    Contents/MacOS/W3 (this); Contents/Resources/game/{build/w3-native,
+           build/shader-service/totk_xlate, build/spirv-cross/spirv-cross, rewritten/local,
            extracted/local/romfs/{index.json, runtime-index.bin, romfs.bin}} (scripts/package_app.py).
    Data:   ~/Library/Application Support/MacNativeGames/W3 (W3_DATA_DIR overrides): profile/ (saves), shader-cache/,
            game-slot/, commands.txt, last-run.log. The GPU switches follow games/w3/README.md. */
@@ -44,14 +45,16 @@ int main(int argc, char **argv) {
 
     char game[PATH_MAX];
     if (find_game(game, sizeof game)) { fprintf(stderr, NAME ": bundled game data not found in this app\n"); return 1; }
-    char runtime[PATH_MAX], modules[PATH_MAX], main_module[PATH_MAX], romfs[PATH_MAX];
+    char runtime[PATH_MAX], translator[PATH_MAX], modules[PATH_MAX], main_module[PATH_MAX], romfs[PATH_MAX];
     join(runtime, game, "build/w3-native");
+    join(translator, game, "build/shader-service/totk_xlate");
     join(modules, game, "rewritten/local");
     join(main_module, modules, "main.patched.bin");
     join(romfs, game, "extracted/local/romfs");
     if (access(runtime, X_OK)) { perror(NAME ": missing runtime"); return 1; }
+    if (access(translator, X_OK)) { perror(NAME ": missing shader translator"); return 1; }
     if (access(main_module, R_OK)) { perror(NAME ": missing game data"); return 1; }
-    if (check) { puts(NAME " launcher: runtime and game data present; game was not launched"); return 0; }
+    if (check) { puts(NAME " launcher: runtime, translator and game data present; game was not launched"); return 0; }
 
     const char *override = getenv("W3_DATA_DIR");
     char data[PATH_MAX];
