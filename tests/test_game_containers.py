@@ -106,6 +106,22 @@ def nca(managed=False, title=TITLE, content=0):
     return encrypted + body
 
 
+def bktr(data):
+    """An update Program NCA: the same synthetic NCA with its RomFS section marked BKTR (the update's patch section)."""
+    from extract_exefs import decrypt
+    header = bytearray(b''.join(decrypt(HEADER, modes.XTS(i.to_bytes(16, 'big')), data[i*512:(i+1)*512]) for i in range(6)))
+    header[0x604] = 4
+    header[0x2a0:0x2c0] = hashlib.sha256(header[0x600:0x800]).digest()
+    return b''.join(encrypt(HEADER, modes.XTS(i.to_bytes(16, 'big')), header[i*512:(i+1)*512]) for i in range(6)) + data[0xc00:]
+
+
+def card_with_update(files):
+    head = bytearray(0x200)
+    head[0x100:0x104] = b'HEAD'
+    struct.pack_into('<Q', head, 0x130, 0x200)
+    return head + partition([('secure', partition(files, hfs=True))], hfs=True)
+
+
 def ticket(personalized=False, bad_key=False):
     data = bytearray(0x2c0)
     struct.pack_into('<I', data, 0, 0x10004)
@@ -206,6 +222,45 @@ class Containers(unittest.TestCase):
             _, result = self.extract(game, success=False)
             self.assertIn('Expected base game metadata', result.stderr)
 
+    def test_card_image_with_its_update_uses_the_base_program(self):
+        # Order as on a real card: the base game's NCAs, then the update's (BKTR Program, Control, Meta ...6800).
+        base = [('base.nca', nca()), ('base-control.nca', nca(content=2)), ('base.cnmt.nca', nca(content=1))]
+        update = [('update.nca', bktr(nca())), ('update-control.nca', nca(content=2)),
+                  ('update.cnmt.nca', nca(title=TITLE + 0x800, content=1))]
+        for name, files in (('base-first', base + update), ('update-first', update + base)):
+            with self.subTest(order=name):
+                game = self.path / f'{name}.xci'
+                game.write_bytes(card_with_update(files))
+                out, _ = self.extract(game, name)
+                manifest = out.parent / 'extraction-manifest.json'
+                self.assertEqual(json.loads(manifest.read_text())['program']['name'], 'base.nca')
+                self.assertEqual((out / 'main').read_bytes(), b'synthetic main')
+                romout = out.parent / 'romfs'
+                p = subprocess.run([sys.executable, SCRIPTS / 'extract_romfs.py', '--keys', self.keys,
+                                    '--manifest', manifest, '--output', romout], capture_output=True, text=True)
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertEqual((romout / 'romfs.bin').read_bytes(), romfs())
+
+    def test_card_image_with_its_update_rejects_other_mixes(self):
+        meta, update_meta = ('base.cnmt.nca', nca(content=1)), ('update.cnmt.nca', nca(title=TITLE + 0x800, content=1))
+        variants = [
+            ('update only', [('update.nca', bktr(nca())), update_meta], 'Expected base game metadata'),
+            ('no update program', [('base.nca', nca()), meta, update_meta], 'Expected one base and one update Program'),
+            ('two base programs', [('a.nca', nca()), ('b.nca', nca()), meta, update_meta], 'Expected one base and one update Program'),
+            ('two update programs', [('base.nca', nca()), ('u1.nca', bktr(nca())), ('u2.nca', bktr(nca())), meta, update_meta],
+             'Expected one base and one update Program'),
+            ('two update metas', [('base.nca', nca()), ('update.nca', bktr(nca())), meta, update_meta,
+                                  ('again.cnmt.nca', nca(title=TITLE + 0x800, content=1))], 'Expected base game metadata'),
+            ('with DLC', [('base.nca', nca()), ('update.nca', bktr(nca())), meta, update_meta,
+                          ('dlc.cnmt.nca', nca(title=TITLE + 0x1001, content=1))], 'Expected base game metadata'),
+        ]
+        for i, (name, files, message) in enumerate(variants):
+            with self.subTest(case=name):
+                game = self.path / f'mix{i}.xci'
+                game.write_bytes(card_with_update(files))
+                _, result = self.extract(game, f'mix{i}', False)
+                self.assertIn(message, result.stderr)
+
     def test_corruption_rejected_by_exefs_and_romfs_integrity(self):
         game = self.path / 'corrupt.nsp'
         image = bytearray(game_image('nsp'))
@@ -255,6 +310,23 @@ class Containers(unittest.TestCase):
             (folder / '0-font0.bfttf').write_bytes(b'corrupt')
             with self.assertRaises(build_app.BuildError):
                 build_app.font_report(folder)
+
+    def test_card_without_fonts_names_the_other_font_sources(self):
+        """#2242: a merged card image ("1G+1U") has an empty or no update partition, so no fonts to take."""
+        secure = ('secure', partition([('program.nca', nca())], hfs=True))
+        empty_update = [('update', partition([], hfs=True)), secure]
+        for name, root in (('empty update partition', empty_update), ('no update partition', [secure])):
+            with self.subTest(name):
+                head = bytearray(0x200)
+                head[0x100:0x104] = b'HEAD'
+                struct.pack_into('<Q', head, 0x130, 0x200)
+                game = self.path / f'{name}.xci'
+                game.write_bytes(head + partition(root, hfs=True))
+                p = subprocess.run([sys.executable, SCRIPTS / 'extract_shared_fonts.py', '--keys', self.keys,
+                                    '--xci', game, '--output', self.path / name / 'fonts'], capture_output=True, text=True)
+                self.assertNotEqual(p.returncode, 0)
+                self.assertIn('--firmware', p.stderr)
+                self.assertIn('--shared-fonts', p.stderr)
 
     def test_npdm_signature_accepts_another_genuine_dump(self):
         # The pinned hash names one dump; Nintendo's signature over the ACID block names every genuine one.
@@ -348,6 +420,23 @@ class Containers(unittest.TestCase):
             next(iter(found.values())).unlink()
             with self.assertRaisesRegex(ValueError, 'missing shared-font'):
                 firmware_data_ncas(folder, load_keys(self.keys))
+
+    def test_firmware_on_exfat_skips_appledouble_files(self):
+        # macOS writes a 4 KB "._<name>" AppleDouble file beside every file it copies to an exFAT / FAT disk.
+        # They sort before the real NCAs and are no NCAs, so a firmware folder on such a disk must still work...
+        folder = self.path / 'exfat'
+        folder.mkdir()
+        appledouble = b'\x00\x05\x16\x07\x00\x02\x00\x00' + bytes(4088)
+        for title in {title for _, _, title, _ in FONTS}:
+            (folder / f'{title}.nca').write_bytes(nca(title=int(title, 16), content=4))
+            (folder / f'._{title}.nca').write_bytes(appledouble)
+        found = firmware_data_ncas(folder, load_keys(self.keys))
+        self.assertEqual(set(found), {title for _, _, title, _ in FONTS})
+        self.assertFalse(any(p.name.startswith('._') for p in found.values()))
+        # ...while a real NCA that does not decrypt (wrong keys, a damaged dump) still stops the build.
+        (folder / 'damaged.nca').write_bytes(appledouble)
+        with self.assertRaisesRegex(ValueError, 'Invalid firmware NCA header'):
+            firmware_data_ncas(folder, load_keys(self.keys))
 
     def test_mac_only(self):
         with patch('build_app.platform.system', return_value='iOS'), self.assertRaisesRegex(build_app.BuildError, 'Mac'):

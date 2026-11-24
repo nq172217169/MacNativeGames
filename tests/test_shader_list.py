@@ -9,7 +9,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT/'games/totk/scripts/shader_list.py'
 KEY = 'a'*64
-VARIANT = KEY+'-'+'b'*12+'_b'
+VARIANT = KEY+'-b7530f698e76_b'   # the default bind state's name (prepare_shader_seed.py SUFFIX)
 PIPELINE = '3'*80
 
 
@@ -29,6 +29,80 @@ class ShaderList(unittest.TestCase):
         r = subprocess.run([sys.executable, str(SCRIPT), *map(str, args)], capture_output=True, text=True)
         self.assertEqual(r.returncode, 0 if good else 1, r.stderr)
         return r.stdout
+
+    def test_resolve_names_each_variant_as_the_versions_seed_serves_its_bind_state(self):
+        sys.path.insert(0, str(SCRIPT.parent))
+        from prepare_shader_seed import SUFFIX, suffix, answers_for
+        mine, two, gone = 'a'*64, 'c'*64, 'd'*64
+        attr = answers_for({'attr': {'0': 'float'}})   # a bind state that made a variant of its own before 2026-10-26
+        cube = answers_for({'tex': {'0': 'cube'}})
+        old, default = f'{mine}-{suffix(attr)}', f'{mine}-{SUFFIX}'
+        def key(vs, fs):
+            return (vs.encode().ljust(80, b'\0')+fs.encode().ljust(80, b'\0')+b'\x07'*40).hex()
+        def a_row(answers):
+            text = json.dumps(answers, sort_keys=True, separators=(',', ':'))
+            return f'A\t{suffix(answers)}\t{text}\n'
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            seed = cache(root/'seed', {mine: [{'variant': default, 'deps': {}}],
+                                       two: [{'variant': f'{two}-{SUFFIX}', 'deps': {'tex': {'0': '2d'}}},
+                                             {'variant': f'{two}-{suffix(cube)}', 'deps': {'tex': {'0': 'cube'}}}]})
+            (seed/'shader-keys.json').write_text(json.dumps({'keys': [mine, two]}))
+            shared = root/'shader_list.tsv'
+            plain = ('R', key(default+'_b', f'{two}-{SUFFIX}_b'))
+            shared.write_text(a_row(attr) + a_row(cube)
+                              + f'R\t{plain[1]}\tt\n'
+                              + f'S\t{gone}-{SUFFIX}_b\t1\tm\n'                                   # another version's shader
+                              + f'R\t{key(old+"_b", f"{two}-{SUFFIX}_b")}\tm\n'                     # the title's row under its old name
+                              + f'R\t{key(old+"_b", f"{two}-{suffix(cube)}_b")}\tm\n'               # named as the seed serves it
+                              + f'R\t{key(f"{gone}-{SUFFIX}_b", f"{two}-{SUFFIX}_b")}\tm\n'         # another version's vertex shader
+                              + f'C\t{two}-{SUFFIX}_b\tm\n')
+            out = self.run_tool('resolve', seed, shared, root/'pso_manifest.tsv', root/'pso_title.tsv')
+            self.assertIn('2 of other game versions', out)
+            self.assertEqual(rows(root/'pso_title.tsv'), ['\t'.join(plain)])
+            self.assertEqual(rows(root/'pso_manifest.tsv'), [f'R\t{key(default+"_b", f"{two}-{suffix(cube)}_b")}',
+                                                            f'C\t{two}-{SUFFIX}_b'])
+
+    def test_resolve_names_a_shader_served_by_another_through_its_index(self):
+        sys.path.insert(0, str(SCRIPT.parent))
+        from prepare_shader_seed import SUFFIX
+        first, twin = 'a'*64, 'c'*64   # a translation cannot tell them apart (prepare_shader_seed.py translation_input)
+        def key(vs, fs):
+            return (vs.encode().ljust(80, b'\0')+fs.encode().ljust(80, b'\0')+b'\x07'*40).hex()
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            index = [{'variant': f'{first}-{SUFFIX}', 'deps': {}}]
+            seed = cache(root/'seed', {first: index, twin: index})
+            (seed/'shader-keys.json').write_text(json.dumps({'keys': [first, twin]}))
+            shared = root/'shader_list.tsv'
+            shared.write_text(f'R\t{key(twin+"-"+SUFFIX+"_b", twin+"-"+SUFFIX+"_b")}\tm\n'
+                              f'R\t{key(first+"-"+SUFFIX+"_b", first+"-"+SUFFIX+"_b")}\tm\n')
+            self.run_tool('resolve', seed, shared, root/'pso_manifest.tsv', root/'pso_title.tsv')
+            self.assertEqual(rows(root/'pso_manifest.tsv'), [f'R\t{key(first+"-"+SUFFIX+"_b", first+"-"+SUFFIX+"_b")}'])
+
+    def test_the_list_keeps_the_bind_state_behind_every_name_and_refuses_rows_without_one(self):
+        sys.path.insert(0, str(SCRIPT.parent))
+        from prepare_shader_seed import SUFFIX, suffix, answers_for
+        def key(vs, fs):
+            return (vs.encode().ljust(80, b'\0')+fs.encode().ljust(80, b'\0')+b'\x07'*40).hex()
+        deps = '{"tex":{"0":"cube"}}'
+        named = f'{KEY}-{suffix(answers_for(json.loads(deps)))}_b'
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            shared = root/'shader_list.tsv'
+            (root/'contribution.tsv').write_text(f'V\t{KEY}\t{deps}\n'                       # what a game writes with the row
+                                                 f'R\t{key(KEY+"-"+SUFFIX+"_b", named)}\n'
+                                                 f'R\t{key(KEY+"-"+"9"*12+"_b", named)}\n')   # a bind state it does not give
+            out = self.run_tool('merge', shared, root/'contribution.tsv')
+            self.assertIn('1 warm rows refused', out)
+            self.assertEqual(len(rows(shared, 'R')), 1)
+            self.assertEqual(rows(shared, 'A'), [f'A\t{named[65:77]}\t' + json.dumps(answers_for(json.loads(deps)), sort_keys=True, separators=(',', ':'))])
+            self.run_tool('stats', shared)
+            text = shared.read_text()   # prune drops the V row a seed's built-in variant serves; the bind state stays
+            shared.write_text(text.replace(f'V\t{KEY}\t{deps}\n', ''))
+            self.run_tool('stats', shared)
+            shared.write_text(text.replace(rows(shared, 'A')[0] + '\n', '').replace(f'V\t{KEY}\t{deps}\n', ''))
+            self.run_tool('stats', shared, good=False)
 
     def test_variants_are_the_shader_and_its_bind_state_not_a_variant_name(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -57,6 +131,32 @@ class ShaderList(unittest.TestCase):
             self.run_tool('export', out, manifest, first)
             self.assertEqual(rows(first), [f'S\t{VARIANT}\t0', f'R\t{PIPELINE}'])
             self.assertEqual(rows(manifest), [f'R\t{PIPELINE}', f'R\t{"4"*80}', f'C\t{VARIANT}'])
+
+    def test_border_recipes_travel_with_their_pipeline(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder); out = root/'list.tsv'
+            fs = '3:7:0x1p-1,0x1p-1,0x1p-1,0x1p-1;'
+            vs = '8:3:0x1p-2,0x1.99999ap-2,0x1.8p-1,0x1.ccccccp-1;9:7:0x0p+0,-0x1p+0,0x1p+0,0x1p+0:f5,5,5,1,3,0x1p+0,0x0p+0,0x1.ep+3;'   # a filtering sampler
+            later = root/'pso_user.tsv'
+            later.write_text(f'R\t{PIPELINE}\nB\t{PIPELINE}\t-\t{fs}\nB\t{PIPELINE}\t{vs}\t-\n'
+                             f'B\t{PIPELINE}\t-\t-\nB\t{PIPELINE}\t-\t3:9:0x1p-1,0x1p-1,0x1p-1,0x1p-1;\nB\t{PIPELINE}\t-\t3:7:0.5,0.5,0.5,0.5;\n')
+            self.assertIn('2 B', self.run_tool('merge', out, later))
+            self.assertEqual(rows(out, 'B'), [f'B\t{PIPELINE}\t-\t{fs}\tm', f'B\t{PIPELINE}\t{vs}\t-\tm'])
+            self.run_tool('export', out, root/'one.tsv')
+            self.assertEqual(rows(root/'one.tsv', 'B'), [f'B\t{PIPELINE}\t-\t{fs}', f'B\t{PIPELINE}\t{vs}\t-'])
+            self.assertIn('2 B', self.run_tool('stats', out))
+
+    def test_tile_reads_travel_with_their_pipeline(self):
+        # the variant reading the draw's attachments from the tile (nvn_mtl.m warm_tileread); only pso_user.tsv had them
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder); out = root/'list.tsv'
+            later = root/'pso_user.tsv'
+            later.write_text(f'R\t{PIPELINE}\nT\t{PIPELINE}\t5:3;7:1;\nT\t{PIPELINE}\t15:0;\nT\t{PIPELINE}\t5:3;7:1;\n'
+                             f'T\t{PIPELINE}\t-\nT\t{PIPELINE}\t5:9;\nT\t{PIPELINE}\t5:3\nT\tnot hex\t5:3;\n')
+            self.assertIn('2 T', self.run_tool('merge', out, later))
+            self.assertEqual(rows(out, 'T'), [f'T\t{PIPELINE}\t5:3;7:1;\tm', f'T\t{PIPELINE}\t15:0;\tm'])
+            self.run_tool('export', out, root/'one.tsv')
+            self.assertEqual(rows(root/'one.tsv', 'T'), [f'T\t{PIPELINE}\t5:3;7:1;', f'T\t{PIPELINE}\t15:0;'])
 
     def test_a_runtime_without_a_title_list_gets_every_warm_row_in_one_file(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -112,8 +212,69 @@ class ShaderList(unittest.TestCase):
         self.assertIn('Breath of the Wild shader list', shader_list.header_for(ROOT/'games/botw/assets/shader_list.tsv'))
         self.assertIn('TOTK shader list', shader_list.header_for('/tmp/anywhere/list.tsv'))
 
-    def test_the_repository_list_is_valid(self):
-        self.assertIn('variants', self.run_tool('stats', ROOT/'games/totk/assets/shader_list.tsv'))
+    def test_the_repository_lists_are_valid(self):
+        # Every list resolve reads (shader_list.py OUR_RUNTIME): a warm row naming a bind state without an A row made
+        # packaging stop with a KeyError (#2020, Pokopia).
+        for game in [g for g in self.load_module().OUR_RUNTIME if g]:
+            with self.subTest(game):
+                self.assertIn('variants', self.run_tool('stats', ROOT/f'games/{game}/assets/shader_list.tsv'))
+
+    def load_module(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('shader_list', SCRIPT)
+        module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+        return module
+
+    def test_pipelines_that_differ_only_in_state_they_do_not_use_are_one_row(self):
+        import struct
+        def key(blend_en, chmask, blend0, blend1):   # nvn_pso_skey.h pso_skey: target 0 is RGBA8 (70), target 1 missing
+            b = bytearray(544); b[0:len(VARIANT)] = VARIANT.encode(); b[80:80+len(VARIANT)] = VARIANT.encode()
+            struct.pack_into('<8I', b, 216, 70, 0, 0, 0, 0, 0, 0, 0)
+            struct.pack_into('<II', b, 260, blend_en, chmask); struct.pack_into('<QQ', b, 272, blend0, blend1)
+            return b.hex()
+        stale, other, clean = key(0b10, 0xff, 0x1234, 0x5678), key(0, 0x0f, 0x9abc, 0), key(0, 0x0f, 0, 0)
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder); out = root/'list.tsv'
+            (root/'pso_user.tsv').write_text(f'R\t{stale}\nR\t{other}\nR\t{clean}\nB\t{stale}\t-\t3:7:0x1p-1,0x1p-1,0x1p-1,0x1p-1;\n')
+            self.run_tool('merge', out, root/'pso_user.tsv')
+            unpack = self.load_module().unpack_key
+            self.assertEqual([unpack(r.split('\t')[1]) for r in rows(out, 'R')], [clean])
+            self.assertEqual([unpack(r.split('\t')[1]) for r in rows(out, 'B')], [clean])
+        self.assertEqual(self.load_module().pipeline_key(PIPELINE), PIPELINE)   # a key of another size stays
+
+    def test_the_repository_lists_hold_normalised_pipeline_keys(self):
+        shader_list = self.load_module()
+        for game in ('totk', 'botw'):
+            for line in rows(ROOT/f'games/{game}/assets/shader_list.tsv'):
+                f = line.split('\t')
+                if f[0] in ('R', 'B', 'T'):
+                    key = shader_list.unpack_key(f[1])
+                    self.assertEqual(shader_list.pipeline_key(key), key, game)
+
+    def test_full_pipeline_keys_are_kept_packed_and_exported_as_hex(self):
+        import struct
+        shader_list = self.load_module()
+        b = bytearray(544); b[0:len(VARIANT)] = VARIANT.encode(); b[80:80+len(VARIANT)] = VARIANT.encode()
+        struct.pack_into('<8I', b, 216, 70, 0x10, 0, 0, 0, 0, 0, 0); b[400:404] = bytes([1, 0, 0, 0x10]); b[543] = 9
+        key = b.hex()
+        packed = shader_list.pack_key(key)
+        self.assertLess(len(packed), len(key) // 3)
+        self.assertEqual(shader_list.unpack_key(packed), key)
+        self.assertEqual(shader_list.pack_key(PIPELINE), PIPELINE)   # a key of another size stays hex
+        self.assertEqual(shader_list.unpack_key(packed[:-3]), packed[:-3])   # a damaged one does not unpack to a short key
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder); out = root/'list.tsv'
+            (root/'pso_user.tsv').write_text(f'R\t{key}\nT\t{key}\t5:3;\n')
+            self.run_tool('merge', out, root/'pso_user.tsv')
+            self.assertEqual(rows(out, 'R'), [f'R\t{packed}\tm'])
+            self.assertEqual(rows(out, 'T'), [f'T\t{packed}\t5:3;\tm'])
+            self.run_tool('merge', root/'again.tsv', out)   # a packed list reads back as the same rows
+            self.assertEqual(rows(root/'again.tsv'), rows(out))
+            self.run_tool('export', out, root/'one.tsv')
+            self.assertEqual(rows(root/'one.tsv'), [f'R\t{key}', f'T\t{key}\t5:3;'])
+            other = root/'games/odyssey/assets/shader_list.tsv'; other.parent.mkdir(parents=True)
+            self.run_tool('merge', other, root/'pso_user.tsv')   # other games' own tools read hex
+            self.assertEqual(rows(other, 'R'), [f'R\t{key}\tm'])
 
 
 if __name__ == '__main__':

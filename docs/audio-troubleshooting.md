@@ -56,8 +56,7 @@ shader code and save formats are unchanged.
    same opening-audio bytes and still reject traversal. `probe-audio` checks
    constructed mixer/decoder state without opening an audio device; it does not
    prove that in-game streaming or the selected speaker/headphones are audible.
-   For a 1.1.2 app, use `rewritten/v112` instead. The added resource integration
-   checks have been exercised locally on 1.0.0, not on 1.1.2.
+   The added resource integration checks have been exercised locally on 1.0.0.
 
 5. Play the opening scene and confirm both dialogue and background music through
    the intended output device. This listening check confirmed the 1.0.0 fix on
@@ -67,7 +66,8 @@ shader code and save formats are unchanged.
 
 - Check the current macOS output device and volume. Test a known system sound;
   if that also fails, inspect the device connection first.
-- Check `~/Library/Logs/MacNativeGames/totk.log` for CoreAudio setup failures,
+- Turn on the log (`defaults write org.macnativegames.totk TOTK_DEBUG_LOG -bool YES`,
+  then start the game again) and check `~/Library/Logs/MacNativeGames/totk.log` for CoreAudio setup failures,
   decode errors and output-level reports. A nonzero mixed level does not by
   itself prove the selected physical output is audible.
 - For local file-open diagnostics, quit the game normally and launch with:
@@ -107,7 +107,44 @@ Checks, without game data:
   samples against an unmodified Ryujinx.Audio (largest difference 4.47e-08), then 1,885,461 checks of the production
   effect graph, routing, capture / circular buffers and output prefill / recovery / stop.
 
+## Audio lost through splitter submix chains (2026-10-22)
+
+The submix ordering previously followed only `dest_mix_id`, even when the mixer
+actually routed through `dest_splitter_id`. A receiving submix could therefore
+be processed before its source. Samples arriving later were never propagated
+to the final mix and were cleared on the next frame.
+
+Ordering now follows every used splitter destination with an active receiving
+mix. Depths are memoized per frame, with a recursion guard for malformed cycles.
+The game-data-free regression exercises direct routing, one splitter, two
+splitters, and a branching path that rejoins a downstream submix:
+
+```sh
+python3 -m unittest discover -s tests -p test_audio_routing.py -v
+```
+
+It compares production-mixer stereo output against independently calculated
+PCM values under UBSan. The two-splitter and branching cases output zeros before
+the fix; all four cases pass afterwards. This verifies routing, while an actual
+in-game listening check is still needed to establish the cause of a particular
+missing-sound report.
+
 ## 中文说明
+
+### 多级混音分流导致音效丢失（2026-10-22）
+
+`audio_mixer.c` 原先只根据 `dest_mix_id` 排序子混音，忽略了分流器指向的
+接收通道。接收通道如果提前输出，后续送入它的声音就无法到达最终输出。
+现在排序会遍历所有启用的分流目标，确保源通道先于每个接收通道处理；
+每帧缓存依赖深度，循环依赖也有边界保护。
+
+无需游戏资源的回归测试包含直接路由、单级分流、两级分流和分支汇合，
+将生产混音器的左右声道与独立计算的 PCM 期望值比较，并启用 UBSan。
+修复前，两级分流及分支汇合两组输出为零；修复后四组均通过。
+运行下方英文部分中的测试命令即可复现。这确认了路由修复；具体场景中的
+缺音症状仍需在游戏内试听，不能仅凭测试通过判定已经解决。
+
+### 流式资源路径
 
 这次确认的问题是：游戏将音频资源拼成了 `content://Sound/...`，旧版
 RomFS 解析器只去掉一个根目录斜杠，随后又将剩余斜杠判为非法路径，导致
@@ -121,7 +158,7 @@ RomFS 解析器只去掉一个根目录斜杠，随后又将剩余斜杠判为�
 验证分三层：27 个无需游戏数据的解析器用例；`probe-fs` 对真实开场音频进行
 单/双/三斜杠路径读取比对；最后实际播放开场，确认对白和配乐。音频混音自检
 单独通过并不代表真实游戏流式播放正常。已实测 1.0.0 开场，不将结果外推为
-所有场景、1.1.2 或其他游戏均已验证。
+所有场景或其他游戏均已验证。
 
 如果仍然无声，先确认 macOS 输出设备与系统提示音，再检查日志中的
 CoreAudio/解码错误及音频电平。着色器首次编译造成的卡顿属于另一类问题。

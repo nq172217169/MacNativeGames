@@ -1,18 +1,28 @@
 /* Breath of the Wild add-on content (botw.md): the DLC's RomFS images, read-only volumes beside the game's (romfs.c), listed
    by nn::aoc and mounted as the game asks (nn::fs::MountAddOnContent("aoc", 1, ...)). The game lists two add-on contents
    (index 1: the expansion pass packs, 7,094 files; index 2: one file) and mounts index 1 only. Each volume is the image
-   games/botw/scripts/extract_aoc_romfs.py extracted and indexed, verified against aoc_config.h (SHA-256 of the image
+   games/botw/scripts/extract_aoc_romfs.py extracted and indexed, verified against aoc-config.txt in the game data folder
+   (game_data.h, scripts/prepare_romfs_backend.py --aoc: SHA-256 of the image
    once, then a proof record as romfs.c keeps one; the index on every start). Built into the Breath of the Wild runtime
-   only; fs_host.c and services.c reach it through the GAME_BOTW macros of fs_host.h. */
+   and Donkey Kong Bananza runtimes only (Bananza's one pack: its .nup or dump folder through scripts/import_dump.py --addons);
+   fs_host.c and services.c reach it through the macros of fs_host.h. */
+#if defined(GAME_BOTW) || defined(GAME_DKB)
 #ifdef GAME_BOTW
+#define AOC_TAG "[botw] "
+#else
+#define AOC_TAG "[dkb] "
+#endif
 #include "runtime.h"
-#include "aoc_config.h"
+#include "game_data.h"
+#include "game_version.h"
 #include "fs_host.h"
 #include "romfs_path.h"
 #include "totk_ui_lang.h"
 #include <CommonCrypto/CommonDigest.h>
+#include <TargetConditionals.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,17 +40,33 @@ typedef struct {
     int index; uint64_t image_size; const char *image_sha, *index_sha;
     uint8_t *index_bytes; size_t index_size; uint64_t file_count, strings_offset; int image_fd; char mount[32]; int loaded;
 } Vol;
-static Vol vols[AOC_MAX] = {
-    {1, AOC1_IMAGE_SIZE, AOC1_IMAGE_SHA256, AOC1_INDEX_SHA256, NULL, 0, 0, 0, -1, "", 0},
-    {2, AOC2_IMAGE_SIZE, AOC2_IMAGE_SHA256, AOC2_INDEX_SHA256, NULL, 0, 0, 0, -1, "", 0},
+static Vol vols[AOC_MAX] = {   /* sizes and hashes: config_load */
+    {1, 0, NULL, NULL, NULL, 0, 0, 0, -1, "", 0},
+    {2, 0, NULL, NULL, NULL, 0, 0, 0, -1, "", 0},
 };
 static struct { uint8_t vol; uint64_t entry; } handles[AOC_NH];   /* entry = file index + 1; 0 is free */
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static void need(int c, const char *m) { if (!c) runtime_fail(m); }
-static int present(const Vol *v) { return (AOC_PRESENT_MASK >> (v->index - 1)) & 1; }
+static pthread_once_t config_once = PTHREAD_ONCE_INIT;
+static unsigned present_mask;   /* bit index - 1: the volume was extracted and indexed */
+static void config_load(void) {
+#ifdef GAME_DKB   /* an app packed before Bananza's add-on content (2026-11-23) has no such file, and no packs */
+    char path[4096]; runtime_game_data_path("aoc-config.txt", path, sizeof path);
+    if (access(path, R_OK)) return;
+#endif
+    present_mask =(unsigned)runtime_game_number("aoc-config.txt", "AOC_PRESENT_MASK");
+    for (int i = 0; i < AOC_MAX; i++) {
+        if (!((present_mask >> i) & 1)) continue;
+        char key[32]; Vol *v = &vols[i];
+        snprintf(key, sizeof key, "AOC%d_IMAGE_SIZE", v->index); v->image_size = runtime_game_number("aoc-config.txt", key);
+        snprintf(key, sizeof key, "AOC%d_IMAGE_SHA256", v->index); v->image_sha = runtime_game_sha256("aoc-config.txt", key);
+        snprintf(key, sizeof key, "AOC%d_INDEX_SHA256", v->index); v->index_sha = runtime_game_sha256("aoc-config.txt", key);
+    }
+}
+static int present(const Vol *v) { pthread_once(&config_once, config_load); return (present_mask >> (v->index - 1)) & 1; }
 static void vol_dir(const Vol *v, char *out, size_t cap) {
     const char *dir = getenv("TOTK_AOC");   /* the folder holding <index>/; default beside the game's RomFS */
-    need(snprintf(out, cap, "%s/%d", dir && *dir ? dir : "extracted/botw160/aoc", v->index) < (int)cap, "add-on content path");
+    need(snprintf(out, cap, "%s/%d", dir && *dir ? dir : "extracted/" TOTK_GAME_DIR "/aoc", v->index) < (int)cap, "add-on content path");
 }
 static Entry entry(const Vol *v, uint64_t i) { Entry e; memcpy(&e, v->index_bytes + 24 + i * 24, 24); return e; }
 static const char *entry_name(const Vol *v, Entry e) { return (const char *)v->index_bytes + v->strings_offset + e.name; }
@@ -51,12 +77,18 @@ static void sha_fd(int fd, const char *expected, uint64_t total, const char *wha
     free(buf);
     uint8_t d[32]; CC_SHA256_Final(d, &c); char hex[65]; for (int i = 0; i < 32; i++) snprintf(hex + 2 * i, 3, "%02x", d[i]);
     if (total && done != total) runtime_fail("add-on content image size changed while hashing");
-    if (strcmp(hex, expected)) { fprintf(stderr, "[botw] add-on content %s: SHA-256 %s, expected %s\n", what, hex, expected); runtime_fail("add-on content image does not match the extraction record"); }
+    if (strcmp(hex, expected)) { fprintf(stderr, AOC_TAG "add-on content %s: SHA-256 %s, expected %s\n", what, hex, expected); runtime_fail("add-on content image does not match the extraction record"); }
 }
 typedef struct { uint64_t size, dev, ino; int64_t mtime_s, mtime_ns, ctime_s, ctime_ns; char sha[65]; } Proof;
 static Proof proof_for(const struct stat *s, const char *sha) {
     Proof p; memset(&p, 0, sizeof p); p.size = (uint64_t)s->st_size; p.dev = (uint64_t)s->st_dev; p.ino = (uint64_t)s->st_ino;
+#if !TARGET_OS_IPHONE
     p.mtime_s = s->st_mtimespec.tv_sec; p.mtime_ns = s->st_mtimespec.tv_nsec; p.ctime_s = s->st_ctimespec.tv_sec; p.ctime_ns = s->st_ctimespec.tv_nsec;
+#else
+    /* iOS rewrites ctime and birthtime when a sealed app bundle is read for the first time (romfs.c proof_equal), and a
+       reinstall moves the bundle: the record names the bytes only (size and the expected SHA-256 the hash proved). */
+    p.dev = p.ino = 0;
+#endif
     snprintf(p.sha, sizeof p.sha, "%s", sha); return p;
 }
 /* The image's full SHA-256 once; afterwards a record of the file's identity (size, inode, times, expected hash) in the
@@ -69,9 +101,9 @@ static void verify_image(Vol *v, const char *dir) {
     int force = getenv("TOTK_ROMFS_VERIFY") && !strcmp(getenv("TOTK_ROMFS_VERIFY"), "full");
     int pf = open(path, O_RDONLY | O_NOFOLLOW);
     if (pf >= 0) { int ok = read(pf, &saved, sizeof saved) == (ssize_t)sizeof saved; close(pf);
-        if (ok && !force && !memcmp(&saved, &want, sizeof want)) { fprintf(stderr, "[botw] add-on content %d unchanged; reused the SHA-256 verification record\n", v->index); return; } }
+        if (ok && !force && !memcmp(&saved, &want, sizeof want)) { fprintf(stderr, AOC_TAG "add-on content %d unchanged; reused the SHA-256 verification record\n", v->index); return; } }
     char what[64]; snprintf(what, sizeof what, "%s %d", TOTK_UI("校验追加内容", "Verifying add-on content"), v->index);
-    fprintf(stderr, "[botw] verifying add-on content %d SHA-256 (%llu bytes)%s\n", v->index, (unsigned long long)v->image_size, force ? " [forced]" : "");
+    fprintf(stderr, AOC_TAG "verifying add-on content %d SHA-256 (%llu bytes)%s\n", v->index, (unsigned long long)v->image_size, force ? " [forced]" : "");
     sha_fd(v->image_fd, v->image_sha, v->image_size, what);
     need(fstat(v->image_fd, &st) == 0 && (uint64_t)st.st_size == v->image_size, "add-on content image stat");
     Proof after = proof_for(&st, v->image_sha); need(!memcmp(&after, &want, sizeof want), "add-on content changed during verification");
@@ -100,12 +132,12 @@ static void vol_load(Vol *v) {
     v->image_fd = open(path, O_RDONLY); need(v->image_fd >= 0, "add-on content image missing");
     verify_image(v, dir);
     v->loaded = 1;
-    fprintf(stderr, "[botw] add-on content %d ready: %llu files, %llu bytes\n", v->index, (unsigned long long)v->file_count, (unsigned long long)v->image_size);
+    fprintf(stderr, AOC_TAG "add-on content %d ready: %llu files, %llu bytes\n", v->index, (unsigned long long)v->file_count, (unsigned long long)v->image_size);
 }
 /* nn::aoc */
 void runtime_aoc_announce(void) {
     int n = 0; for (int i = 0; i < AOC_MAX; i++) n += present(&vols[i]);
-    fprintf(stderr, "[botw] add-on content: %d of %d packs extracted (TOTK_AOC: the folder holding <index>/romfs.bin)\n", n, AOC_MAX);
+    fprintf(stderr, AOC_TAG "add-on content: %d of %d packs extracted (TOTK_AOC: the folder holding <index>/romfs.bin)\n", n, AOC_MAX);
 }
 int runtime_aoc_count(void) { int n = 0; for (int i = 0; i < AOC_MAX; i++) n += present(&vols[i]); return n; }
 int runtime_aoc_list(int *out, int offset, int count) {
@@ -114,14 +146,23 @@ int runtime_aoc_list(int *out, int offset, int count) {
     return n;
 }
 /* nn::fs */
-unsigned runtime_aoc_cache_size(uint64_t *out, int index) { if (!out || index < 1 || index > AOC_MAX) return INVALID; *out = 0; return 0; }
+unsigned runtime_aoc_cache_size(uint64_t *out, int index) {
+    if (!out || index < 1 || index > AOC_MAX) return INVALID;
+    *out = 0;
+#ifdef GAME_DKB   /* a real mount's cache is the size of the pack's file table (nxnative hle_fs.c): this index's, at least a page */
+    *out = 0x1000; const Vol *v = &vols[index - 1]; char dir[4096], path[4200]; struct stat st;
+    if (present(v)) { vol_dir(v, dir, sizeof dir);
+        if (snprintf(path, sizeof path, "%s/runtime-index.bin", dir) < (int)sizeof path && !stat(path, &st) && (uint64_t)st.st_size > *out) *out = (uint64_t)st.st_size; }
+#endif
+    return 0;
+}
 unsigned runtime_aoc_mount(const char *name, int index, void *cache, uint64_t size) {
     (void)cache; (void)size;
     if (!name || !*name || strlen(name) >= sizeof vols[0].mount || strchr(name, '/') || strchr(name, ':') || index < 1 || index > AOC_MAX) return INVALID;
     Vol *v = &vols[index - 1]; if (!present(v)) return NOT_FOUND;
     vol_load(v);
     pthread_mutex_lock(&lock); snprintf(v->mount, sizeof v->mount, "%s", name); pthread_mutex_unlock(&lock);
-    fprintf(stderr, "[botw] fs mount %s: -> add-on content %d\n", name, index);
+    fprintf(stderr, AOC_TAG "fs mount %s: -> add-on content %d\n", name, index);
     return 0;
 }
 static Vol *vol_of_path(const char *path, const char **rel) {
@@ -138,14 +179,22 @@ int runtime_aoc_owns_name(const char *name) {
     return 0;
 }
 void runtime_aoc_unmount(const char *name) {
-    for (int i = 0; i < AOC_MAX; i++) if (vols[i].loaded && !strcmp(vols[i].mount, name)) { pthread_mutex_lock(&lock); vols[i].mount[0] = 0; pthread_mutex_unlock(&lock); fprintf(stderr, "[botw] fs unmount %s (add-on content %d)\n", name, vols[i].index); }
+    for (int i = 0; i < AOC_MAX; i++) if (vols[i].loaded && !strcmp(vols[i].mount, name)) { pthread_mutex_lock(&lock); vols[i].mount[0] = 0; pthread_mutex_unlock(&lock); fprintf(stderr, AOC_TAG "fs unmount %s (add-on content %d)\n", name, vols[i].index); }
 }
 static uint64_t lower(const Vol *v, const char *name) { uint64_t lo = 0, hi = v->file_count; while (lo < hi) { uint64_t m = lo + (hi - lo) / 2; if (strcmp(entry_name(v, entry(v, m)), name) < 0) lo = m + 1; else hi = m; } return lo; }
+/* TOTK_AOC_TRACE=1: which files of the packs the game opens (the first 256, and every file it asks for that is not there). */
+static void trace_open(const char *path, int found) {
+    static int on = -1; static _Atomic int shown;
+    if (on < 0) { const char *e = getenv("TOTK_AOC_TRACE"); on = e && *e && strcmp(e, "0"); }
+    if (on && (!found || atomic_fetch_add(&shown, 1) < 256)) fprintf(stderr, AOC_TAG "add-on open %s: %s\n", path, found ? "ok" : "NOT FOUND");
+}
 unsigned runtime_aoc_open(uint64_t *out, const char *path, int mode) {
     const char *p = NULL; Vol *v = vol_of_path(path, &p);
     if (!out || mode != 1) return UNSUPPORTED;
     if (!v || !p) return NOT_FOUND;
-    uint64_t i = lower(v, p); if (i >= v->file_count || strcmp(p, entry_name(v, entry(v, i)))) return NOT_FOUND;
+    uint64_t i = lower(v, p); int found = i < v->file_count && !strcmp(p, entry_name(v, entry(v, i)));
+    trace_open(path, found);
+    if (!found) return NOT_FOUND;
     pthread_mutex_lock(&lock);
     for (unsigned j = 1; j < AOC_NH; j++) if (!handles[j].entry) { handles[j].vol = (uint8_t)(v - vols); handles[j].entry = i + 1; *out = AOC_HANDLE_BASE + j; pthread_mutex_unlock(&lock); return 0; }
     pthread_mutex_unlock(&lock); runtime_fail("add-on content file handle table full"); return INVALID;
