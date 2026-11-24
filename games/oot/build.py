@@ -675,7 +675,7 @@ def package_app(work,tree,out,game_data_mode='app',game_data_folder=None,shared=
     # the installed App is touched; a second check here read the 6.8 GB archive again (10.5 s) and could not pass a
     # signature-only bundle, which is only complete once install_app moved the installed one in.
     # The installed .app folder stays and takes the new contents: macOS keeps its first-run check of an app with the folder.
-    while app_running(out):time.sleep(5)   # the build may have taken a while: the App is replaced only once it is closed
+    wait_until_game_closed(out)   # the build may have taken a while: replace the App only once the game is closed
     build_app.install_app(temporary,out)
     took('installed, its seal checked')
     # What this build replaced and no later one reads (old translation contexts, moved-aside bundles and libraries,
@@ -714,6 +714,34 @@ def app_running(app):
         if options==['--update-check'] or (len(options)==2 and options[0]=='--update-install' and options[1].isdigit() and int(options[1])>0):continue
         return True
     return False
+
+def wait_until_game_closed(app, timeout=None):
+    """Wait for the player to close the game before replacing its resources; never end the game for them.
+    A player who starts the game while an update is preparing used to leave the update printing 'waiting for the game
+    to close' for ever (2026-11-24: an express update waited ~5 min and had to be cancelled by hand). Say what is
+    happening, repeat every 60 s, and cancel the update cleanly after a timeout instead of waiting indefinitely.
+    The timeout is only a guard for a forgotten/stalled update: a player who is actually playing just closes the game
+    and the update carries on. OOT_UPDATE_WAIT_TIMEOUT overrides the default (seconds; 0 = no limit)."""
+    if timeout is None:
+        try:timeout=int(os.environ.get('OOT_UPDATE_WAIT_TIMEOUT','900'))
+        except ValueError:timeout=900
+    start=time.monotonic();told=None
+    while app_running(app):
+        now=time.monotonic()
+        if told is None:
+            print('The game is still open. Please close it to finish the update; '
+                  'the update will cancel itself if it keeps running. '
+                  '游戏仍在运行，请关闭游戏以完成更新；超时将自动取消。',flush=True)
+            told=now
+        elif now-told>=60:
+            left='' if timeout<=0 else f' ({(timeout-(now-start))/60:.0f} min left / 剩余约 {(timeout-(now-start))/60:.0f} 分钟)'
+            print(f'Still waiting for the game to close{left}... / 仍在等待游戏关闭...',flush=True)
+            told=now
+        if timeout>0 and now-start>=timeout:
+            raise TimeoutError(f'the game is still open after {timeout} s; update cancelled — close it and try again. '
+                               f'游戏在 {timeout} 秒后仍未关闭，更新已取消；请关闭游戏后重试。')
+        time.sleep(2)
+    return time.monotonic()-start
 
 def seed_context_matches(tree,metadata):
     """The seed (its seed-manifest.json `metadata`) was translated in this repository's translation context: the same chain,
@@ -780,10 +808,7 @@ def update_runtime(app,work=None,remake=False,shared=None):
     blocker=update_blocker(work,mode,remake=remake)
     if blocker:raise ValueError(blocker)
     if remake and mode!='title':print('fast update: every shader is translated again from the work folder (a new translation chain or translator)',flush=True)
-    told=False
-    while app_running(app):
-        if not told:print('waiting for the game to close',flush=True);told=True
-        time.sleep(5)
+    waited=wait_until_game_closed(app)
     start=time.monotonic()
     sync_tree(GAME,tree)
     logs=work/'logs';logs.mkdir(exist_ok=True)
@@ -816,10 +841,7 @@ def update_shaders(app,listfile,work=None):
     metadata=json.loads(manifest.read_text())
     if not seed_context_matches(tree,metadata):
         raise ValueError('this repository translates for another chain or translator than the App\'s shaders: update the App first')
-    told=False
-    while app_running(app):
-        if not told:print('waiting for the game to close',flush=True);told=True
-        time.sleep(5)
+    waited=wait_until_game_closed(app)
     start=time.monotonic();logs=work/'logs';logs.mkdir(exist_ok=True)
     env=dict(os.environ,DM_RULESET='native',DM_PRIVATE_GATES='0')
     def run(cmd,name,cwd=tree):
