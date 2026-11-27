@@ -46,6 +46,7 @@ Saves, the shader cache and the log (`last-run.log`) are in `Kirby Data` next to
 | Graphics & Shaders | Verified | All 27,278 shaders of the game translated and compiled to `.metallib` when the app is built |
 | Audio & Video | Verified | Opus audio; VP9 movies with libvpx, their Vorbis sound track with stb_vorbis (`runtime/movie_host.c`, after nxnative's `hle_movie.c`) |
 | Saves | Verified | Auto-save backups retained across sessions |
+| Two Players | Implemented | First controller (with keyboard/touch) is player 1; the second controller is Switch Npad id 1 with the same button layout. `TOTK_TWO_PLAYERS=0` merges all controllers into player 1 as before |
 
 ## Language
 

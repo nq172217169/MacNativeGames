@@ -62,6 +62,52 @@ class AppRunningTests(unittest.TestCase):
         self.assertTrue(self.running('--update-install x'))   # not the helper's form: treated as the game
 
 
+class WaitUntilGameClosedTests(unittest.TestCase):
+    """2026-11-24: an express update waited for a player's open game for ever. The wait must guide the player,
+    keep waiting while they close it, and cancel itself after a timeout — never end the game for them."""
+
+    def run_wait(self, running_states, timeout=300, ticks=()):
+        """Drive app_running() through running_states (one bool per call); time via ticks (monotonic values)."""
+        calls = iter(running_states)
+        times = iter(ticks)
+        out = []
+        with mock.patch.object(build, 'app_running', side_effect=lambda app: next(calls)), \
+             mock.patch.object(build.time, 'monotonic', side_effect=lambda: next(times)), \
+             mock.patch.object(build.time, 'sleep'), \
+             mock.patch('builtins.print', side_effect=lambda *a, **k: out.append(' '.join(map(str, a)))):
+            return build.wait_until_game_closed(Path('/Apps/Ocarina of Time.app'), timeout=timeout), out
+
+    def test_game_closed_returns_without_prompt(self):
+        waited, out = self.run_wait([False], ticks=(0.0, 0.0))
+        self.assertEqual(waited, 0.0)
+        self.assertEqual(out, [])
+
+    def test_waits_then_continues_when_player_closes_it(self):
+        # running, running, then closed; monotonic: start, first loop, second check after sleep
+        waited, out = self.run_wait([True, True, False], ticks=(0.0, 1.0, 3.0, 3.0))
+        self.assertEqual(len(out), 1)
+        self.assertIn('游戏仍在运行', out[0])
+        self.assertIn('close it', out[0])
+
+    def test_times_out_and_cancels_without_ending_the_game(self):
+        with self.assertRaises(TimeoutError) as ctx:
+            self.run_wait([True], timeout=10, ticks=(0.0, 11.0))
+        self.assertIn('游戏在 10 秒后仍未关闭', str(ctx.exception))
+        self.assertIn('update cancelled', str(ctx.exception))
+
+    def test_no_limit_timeout_never_raises(self):
+        # timeout 0 disables the guard; the game closing still ends the wait
+        waited, _ = self.run_wait([True, True, False], timeout=0, ticks=(0.0, 1.0, 3.0, 3.0))
+        self.assertEqual(waited, 3.0)
+
+    def test_reminds_every_minute(self):
+        # running for >120 s: first notice plus a 60 s reminder
+        waited, out = self.run_wait([True, True, True, False], timeout=300,
+                                    ticks=(0.0, 1.0, 61.0, 63.0, 63.0))
+        self.assertEqual(len(out), 2)
+        self.assertIn('剩余约', out[1])
+
+
 class ToolCheckTests(unittest.TestCase):
     """#2070 (the reporter's M5 build): without ffmpeg the build ran for minutes and stopped at the opening overlay. Since
     fa394da8 (2026-11-12) the overlay cuts its clip in Python (scripts/webm_one_frame.py, the same bytes as ffmpeg's

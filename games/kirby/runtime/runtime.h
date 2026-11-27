@@ -131,6 +131,10 @@ void *runtime_by3_override(const char *name);   /* runtime/system_services.c: Ba
 typedef struct { uint64_t buttons; int32_t lx,ly,rx,ry; int connected; } RuntimeGamepadState;
 void runtime_gamepad_start(void);
 void runtime_gamepad_read(RuntimeGamepadState *out);
+void runtime_gamepad_read_player2(RuntimeGamepadState *out);   /* gamepad.m: the second controller (Switch Npad id 1) */
+int runtime_gamepad_player2_connected(void);
+void runtime_gamepad_clear_player1(void);   /* the guest disconnected only player 1 */
+void runtime_gamepad_clear_player2(void);   /* the guest disconnected only controller No. 2 */
 /* Forget held buttons and sticks: macOS stops delivering controller events (including releases) while the app is in
    the background, so a button held at focus loss would otherwise stay pressed for the game. */
 void runtime_gamepad_clear(void);

@@ -11,8 +11,9 @@ typedef struct{int64_t sampling;uint64_t buttons;int32_t lx,ly,rx,ry;uint32_t at
 _Static_assert(sizeof(NpadState)==40,"Npad full-key ABI");
 static pthread_mutex_t inputLock=PTHREAD_MUTEX_INITIALIZER;
 static unsigned char keys[128];static uint64_t pending;
-static uint32_t styles=1;static bool enabled,allowed=true;static int holdType;
-static int64_t sample;static uint64_t padSeen;
+static uint32_t styles=1;static bool enabled,allowed=true,allowed2;static int holdType;  /* allowed2: the game lists controller No. 2 (id 1) */
+static bool disconnected2;   /* the guest disconnected Npad 1; the controller support applet may reconnect it */
+static int64_t sample;static uint64_t padSeen,padSeen2;
 /* F/T/H/G map the D-pad left/up/right/down, keeping both analog-stick mappings independent. */
 static uint64_t button(unsigned code){switch(code){case 38:return 1;case 40:case 49:return 2;case 34:return 4;case 32:return 8;case 6:return 16;case 8:return 32;case 12:return 64;case 14:return 128;case 58:return 256;case 56:return 512;case 36:return 1024;case 48:case 53:return 2048;case 3:return 4096;case 17:return 8192;case 4:return 16384;case 5:return 32768;default:return 0;}}
 /* Real user input (a window key, a controller button, a stick pushed past half) stops TOTK_AUTOLOAD and is logged at most
@@ -46,14 +47,25 @@ static void initialize(void){pthread_mutex_lock(&inputLock);enabled=true;pthread
 /* TOTK_INPUT_LOG=1: one line per new (state kind, controller id, style set) the game reads (which pad the game uses). */
 static void input_log(const char *what,uint32_t id){static int on=-1;static uint64_t seen[64];static unsigned n;if(on<0)on=getenv("TOTK_INPUT_LOG")!=NULL;if(!on)return;
  uint64_t k=(uint64_t)(uintptr_t)what<<32^id^(uint64_t)styles<<48;for(unsigned i=0;i<n;i++)if(seen[i]==k)return;if(n<64)seen[n++]=k;
- fprintf(stderr,"[totk-input] game reads %s for controller %#x (supported styles %#x, ids allowed %d)\n",what,id,styles,allowed);}
+ fprintf(stderr,"[totk-input] game reads %s for controller %#x (supported styles %#x, ids allowed %d/%d)\n",what,id,styles,allowed,allowed2);}
 static uint32_t pad_id(void){return runtime_handheld_mode()?0x20u:0u;}
 /* Kirby: one controller of one kind. With the pad reported under several styles and under both ids 0 and 0x20 the game
-   switched between them while playing (button prompts flashing, the car twitching, the world advancing ~2 frames in 7). */
+   switched between them while playing (button prompts flashing, the car twitching, the world advancing ~2 frames in 7).
+   Player 1 therefore keeps exactly one id/style; only id 1 (the second Mac controller) is added as player 2. */
 static uint32_t pad_style(void){return runtime_handheld_mode()?2u:1u;}
 static bool pad_id_ok(uint32_t id){return id==pad_id();}
+static bool player2_id(uint32_t id){return !runtime_handheld_mode()&&pad_id()!=1&&id==1;}
+static bool player2_on(void){return enabled&&allowed2&&!disconnected2&&player2_id(1)&&runtime_gamepad_player2_connected();}
+static void stick_direction_bits(NpadState *state){const int t=16384;
+ state->buttons|=(uint64_t)(state->lx<-t)<<16|(uint64_t)(state->ly>t)<<17|(uint64_t)(state->lx>t)<<18|(uint64_t)(state->ly<-t)<<19|
+                 (uint64_t)(state->rx<-t)<<20|(uint64_t)(state->ry>t)<<21|(uint64_t)(state->rx>t)<<22|(uint64_t)(state->ry<-t)<<23;}
+static void player2_state(NpadState *state){RuntimeGamepadState pad;runtime_gamepad_read_player2(&pad);state->attributes=1;state->buttons=pad.buttons;
+ state->lx=pad.lx;state->ly=pad.ly;state->rx=pad.rx;state->ry=pad.ry;
+ if(pad.buttons&~padSeen2||abs(pad.lx)>16384||abs(pad.ly)>16384||abs(pad.rx)>16384||abs(pad.ry)>16384)user_input("player 2 controller");padSeen2=pad.buttons;
+ stick_direction_bits(state);}
 static void supported_ids(const uint32_t *ids,uint64_t n){if(n>10||(!ids&&n))runtime_fail("invalid controller ids");
- if(getenv("TOTK_INPUT_LOG")){char b[128];size_t o=0;for(uint64_t i=0;i<n&&o<100;i++)o+=(size_t)snprintf(b+o,sizeof b-o," %#x",ids[i]);b[o]=0;fprintf(stderr,"[totk-input] game supports controller ids:%s\n",b);}pthread_mutex_lock(&inputLock);allowed=false;for(uint64_t i=0;i<n;i++)if(ids[i]==pad_id()||ids[i]==0||ids[i]==0x20)allowed=true;pthread_mutex_unlock(&inputLock);}
+ if(getenv("TOTK_INPUT_LOG")){char b[128];size_t o=0;for(uint64_t i=0;i<n&&o<100;i++)o+=(size_t)snprintf(b+o,sizeof b-o," %#x",ids[i]);b[o]=0;fprintf(stderr,"[totk-input] game supports controller ids:%s\n",b);}
+ pthread_mutex_lock(&inputLock);allowed=allowed2=false;disconnected2=false;for(uint64_t i=0;i<n;i++){if(ids[i]==pad_id()||ids[i]==0||ids[i]==0x20)allowed=true;if(ids[i]==1)allowed2=true;}pthread_mutex_unlock(&inputLock);}
 static void supported_styles(uint32_t value){pthread_mutex_lock(&inputLock);styles=value;pthread_mutex_unlock(&inputLock);}
 static uint32_t style(const uint32_t *id){
     if(!id)runtime_fail("controller id pointer");
@@ -61,6 +73,7 @@ static uint32_t style(const uint32_t *id){
     pthread_mutex_lock(&inputLock);
     uint32_t v = 0;
     if(enabled && allowed && pad_id_ok(*id)) v = pad_style();
+    if(player2_id(*id) && player2_on()) v = styles&1u;
     pthread_mutex_unlock(&inputLock);
     return v;
 }
@@ -70,24 +83,26 @@ static int handheld_states(NpadState *out,int max,const uint32_t *id){return pad
 static int joy_dual_states(NpadState *out,int max,const uint32_t *id){return pad_states(out,max,id,4);}
 static int joy_left_states(NpadState *out,int max,const uint32_t *id){return pad_states(out,max,id,8);}
 static int joy_right_states(NpadState *out,int max,const uint32_t *id){return pad_states(out,max,id,16);}
-static int pad_states(NpadState *out,int max,const uint32_t *id,uint32_t want_style){if(max<=0)return 0;if(id)input_log(want_style==2?"handheld state":want_style==4?"joy-dual state":"full-key state",*id);if(!out||!id)runtime_fail("controller output pointer");pthread_mutex_lock(&inputLock);NpadState state={.sampling=++sample};bool id_match=(!id||pad_id_ok(*id));if(enabled&&allowed&&id_match&&((want_style&pad_style())!=0)){
- state.attributes=1;for(unsigned i=0;i<128;i++)if(keys[i])state.buttons|=button(i);state.buttons|=pending;pending=0;
- state.lx=32767*((int)keys[2]-(int)keys[0]);state.ly=32767*((int)keys[13]-(int)keys[1]);state.rx=32767*((int)keys[124]-(int)keys[123]);state.ry=32767*((int)keys[126]-(int)keys[125]);
- RuntimeGamepadState pad;runtime_gamepad_read(&pad);state.buttons|=pad.buttons;
- if(pad.buttons&~padSeen||abs(pad.lx)>16384||abs(pad.ly)>16384||abs(pad.rx)>16384||abs(pad.ry)>16384)user_input("controller");padSeen=pad.buttons;
- if(abs(pad.lx)>abs(state.lx))state.lx=pad.lx;if(abs(pad.ly)>abs(state.ly))state.ly=pad.ly;
- if(abs(pad.rx)>abs(state.rx))state.rx=pad.rx;if(abs(pad.ry)>abs(state.ry))state.ry=pad.ry;
- /* NpadButton stick directions (bits 16-23: L left/up/right/down, then R), which the Switch sets from the analog sticks
-    past half deflection; Odyssey's camera tutorial left Mario lying with the analog values alone (2026-10-22). */
- const int t=16384;
- state.buttons|=(uint64_t)(state.lx<-t)<<16|(uint64_t)(state.ly>t)<<17|(uint64_t)(state.lx>t)<<18|(uint64_t)(state.ly<-t)<<19|
-                (uint64_t)(state.rx<-t)<<20|(uint64_t)(state.ry>t)<<21|(uint64_t)(state.rx>t)<<22|(uint64_t)(state.ry<-t)<<23;
+static int pad_states(NpadState *out,int max,const uint32_t *id,uint32_t want_style){if(max<=0)return 0;if(id)input_log(want_style==2?"handheld state":want_style==4?"joy-dual state":"full-key state",*id);if(!out||!id)runtime_fail("controller output pointer");pthread_mutex_lock(&inputLock);NpadState state={.sampling=++sample};int player=player2_id(*id)?1:0;
+ if(player==1){
+  /* The second Mac controller is the Switch's controller No. 2 (id 1, full key), only while the game lists that id. */
+  if(want_style==1&&(styles&1u)&&player2_on())player2_state(&state);
+ }else if(enabled&&allowed&&pad_id_ok(*id)&&((want_style&pad_style())!=0)){
+  state.attributes=1;for(unsigned i=0;i<128;i++)if(keys[i])state.buttons|=button(i);state.buttons|=pending;pending=0;
+  state.lx=32767*((int)keys[2]-(int)keys[0]);state.ly=32767*((int)keys[13]-(int)keys[1]);state.rx=32767*((int)keys[124]-(int)keys[123]);state.ry=32767*((int)keys[126]-(int)keys[125]);
+  RuntimeGamepadState pad;runtime_gamepad_read(&pad);state.buttons|=pad.buttons;
+  if(pad.buttons&~padSeen||abs(pad.lx)>16384||abs(pad.ly)>16384||abs(pad.rx)>16384||abs(pad.ry)>16384)user_input("controller");padSeen=pad.buttons;
+  if(abs(pad.lx)>abs(state.lx))state.lx=pad.lx;if(abs(pad.ly)>abs(state.ly))state.ly=pad.ly;
+  if(abs(pad.rx)>abs(state.rx))state.rx=pad.rx;if(abs(pad.ry)>abs(state.ry))state.ry=pad.ry;
+  /* NpadButton stick directions (bits 16-23: L left/up/right/down, then R), which the Switch sets from the analog sticks
+     past half deflection; Odyssey's camera tutorial left Mario lying with the analog values alone (2026-10-22). */
+  stick_direction_bits(&state);
  }*out=state;pthread_mutex_unlock(&inputLock);
  if(getenv("TOTK_INPUT_TRACE")){
-  static uint64_t previous;static int32_t sticks[4];
-  int changed=state.lx!=sticks[0]||state.ly!=sticks[1]||state.rx!=sticks[2]||state.ry!=sticks[3];
-  if(state.buttons!=previous||changed)fprintf(stderr,"[totk-input] guest controller %#x style %#x buttons %#llx L %d,%d R %d,%d sample %lld\n",*id,want_style,(unsigned long long)state.buttons,state.lx,state.ly,state.rx,state.ry,(long long)state.sampling);
-  previous=state.buttons;sticks[0]=state.lx;sticks[1]=state.ly;sticks[2]=state.rx;sticks[3]=state.ry;
+  static NpadState previous[2];NpadState *last=&previous[player];
+  if(state.buttons!=last->buttons||state.lx!=last->lx||state.ly!=last->ly||state.rx!=last->rx||state.ry!=last->ry)
+   fprintf(stderr,"[totk-input] guest controller %#x style %#x buttons %#llx L %d,%d R %d,%d sample %lld\n",*id,want_style,(unsigned long long)state.buttons,state.lx,state.ly,state.rx,state.ry,(long long)state.sampling);
+  *last=state;
  }
  return 1;}
 static int disconnected_states(NpadState *out,int max,const uint32_t *id){if(id)input_log("joy-con state",*id);if(max<=0)return 0;if(!out)runtime_fail("controller output pointer");pthread_mutex_lock(&inputLock);*out=(NpadState){.sampling=++sample};pthread_mutex_unlock(&inputLock);return 1;}
@@ -125,7 +140,17 @@ static uint32_t init_vibration(const void *h) { (void)h; return 0; }
 static uint32_t send_vibration(const void *h, const void *v) { (void)h; (void)v; return 0; }
 static uint32_t parse_vibration_file(void *info, void *ctx, const void *data, size_t size) { (void)info; (void)ctx; (void)data; (void)size; return 0; }
 static uint32_t retrieve_vibration(void *val, int pos, void *ctx) { if (val) memset(val, 0, 16); (void)pos; (void)ctx; return 0; }
-static void disconnect(const uint32_t *id){if(!id)runtime_fail("disconnect id");input_log("disconnect",*id);if(*id==pad_id()){   /* only the pad in use: in handheld mode TOTK disconnects player 1 */pthread_mutex_lock(&inputLock);allowed=false;pthread_mutex_unlock(&inputLock);runtime_input_clear();}}
+static void disconnect(const uint32_t *id){
+ if(!id)runtime_fail("disconnect id");input_log("disconnect",*id);
+ pthread_mutex_lock(&inputLock);
+ if(player2_id(*id)){
+  /* Player 2 only: player 1's keyboard, latches and controller keep their state. The applet may reconnect id 1. */
+  disconnected2=true;padSeen2=0;pthread_mutex_unlock(&inputLock);runtime_gamepad_clear_player2();
+ }else if(*id==pad_id()){
+  /* In handheld mode Kirby disconnects player 1; a two-player session must not throw player 2 away with it. */
+  allowed=false;memset(keys,0,sizeof keys);pending=0;padSeen=0;pthread_mutex_unlock(&inputLock);runtime_gamepad_clear_player1();
+ }else pthread_mutex_unlock(&inputLock);
+}
 /* Mouse and keyboard devices: the Mac keyboard drives the full-key controller, so the game sees no mouse
    (not connected) and a keyboard with no keys, avoiding duplicated input. Layouts follow the SDK (0x28 / 0x30 bytes). */
 typedef struct{int64_t sampling;int32_t x,y,dx,dy,wx,wy;uint32_t buttons,attributes;} MouseState;
@@ -136,14 +161,15 @@ static void initialize_mouse(void){pthread_mutex_lock(&inputLock);mouseReady=tru
 static void initialize_keyboard(void){pthread_mutex_lock(&inputLock);keyboardReady=true;pthread_mutex_unlock(&inputLock);}
 static int mouse_states(MouseState *out,int max){if(max<=0)return 0;if(!out)runtime_fail("mouse output pointer");pthread_mutex_lock(&inputLock);if(!mouseReady)runtime_fail("mouse used before InitializeMouse");*out=(MouseState){.sampling=++sample};pthread_mutex_unlock(&inputLock);return 1;}
 static void keyboard_state(KeyboardState *out){if(!out)runtime_fail("keyboard output pointer");pthread_mutex_lock(&inputLock);if(!keyboardReady)runtime_fail("keyboard used before InitializeKeyboard");*out=(KeyboardState){.sampling=++sample};pthread_mutex_unlock(&inputLock);}
-/* Controller support applet (the Switch's "connect controllers" screen). TOTK opens it in handheld mode; there is
-   exactly one controller here, so it returns at once: one player, on the controller in use (ControllerSupportResultInfo:
-   int8 player count, 3 bytes padding, uint32 selected id). */
+/* Controller support applet (the Switch's "connect controllers" screen). The controllers are already assigned here, so
+   it returns at once: one player, or two while the second Mac controller is connected and the game lists Npad id 1
+   (ControllerSupportResultInfo: int8 player count, 3 bytes padding, uint32 selected id). */
 typedef struct{int8_t players;uint8_t pad[3];uint32_t selected;} ControllerSupportResult;
 _Static_assert(sizeof(ControllerSupportResult)==8,"controller support result ABI");
 static uint32_t show_controller_support(ControllerSupportResult *out,const void *arg){
- (void)arg;if(out)*out=(ControllerSupportResult){.players=1,.selected=pad_id()};
- static int once;if(!once++)fprintf(stderr,"[totk] controller support applet: one player on controller %#x\n",pad_id());
+ (void)arg;pthread_mutex_lock(&inputLock);disconnected2=false;int8_t players=player2_on()?2:1;pthread_mutex_unlock(&inputLock);
+ if(out)*out=(ControllerSupportResult){.players=players,.selected=pad_id()};
+ static int last;if(last!=players){last=players;fprintf(stderr,"[totk] controller support applet: %d player%s, player 1 on controller %#x\n",players,players>1?"s":"",pad_id());}
  return 0;
 }
 /* Bayonetta 3 reads one state at a time (GetNpadState), has a touch screen (no touches here: the Mac has none), and sets
