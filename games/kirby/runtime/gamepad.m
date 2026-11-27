@@ -5,6 +5,7 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include "runtime.h"
 #include "gamepad_layout.h"   // face buttons by position (PlayStation, Xbox) or label (Nintendo)
 #include "controller_map.h"   // the player's button layout (controls.txt)
@@ -12,6 +13,11 @@
 static pthread_mutex_t gamepadLock = PTHREAD_MUTEX_INITIALIZER;
 static RuntimeGamepadState gamepadState;
 static uint64_t pressedEdges;
+/* Controllers in connection order: player 1 is the first seat, player 2 the second. Keeping our own list also gives
+   diagnostics a stable seat when macOS reorders GCController.controllers during hotplug. */
+static NSMutableArray<GCController *> *controllers;
+static RuntimeGamepadState player2State;
+static uint64_t player2Edges;
 static BOOL started;
 static uint16_t controllerMap[CONTROLLER_BUTTONS];
 static uint8_t controllerModes[CONTROLLER_BUTTONS];
@@ -76,12 +82,42 @@ static uint64_t gamepad_buttons(GCExtendedGamepad *pad, int by_position) {
     return buttons;
 }
 
+/* Two-player Kirby: the first controller stays player 1, with the keyboard and touch controls; the second controller
+   is the Switch's controller No. 2 (runtime/input.c maps it to Npad id 1), with the same layout file but held buttons
+   only. TOTK_TWO_PLAYERS=0 merges every controller into player 1, as before. */
+static int two_players(void) {
+    static int value = -1;
+    if (value < 0) { const char *env = getenv("TOTK_TWO_PLAYERS"); value = !(env && !strcmp(env, "0")); }
+    return value;
+}
+static void add_controller(GCController *controller) {
+    if (!controller) return;
+    if (!controllers) controllers = [NSMutableArray array];
+    if (![controllers containsObject:controller]) [controllers addObject:controller];
+}
+
 static void refresh_gamepads(void) {
-    RuntimeGamepadState next = {0};
-    uint64_t physical = 0;
-    for (GCController *controller in GCController.controllers) {
+    RuntimeGamepadState next = {0}, second = {0};
+    uint64_t physical = 0, physical2 = 0;
+    int seat = 0;
+    NSArray *list = controllers ?: GCController.controllers;
+    for (GCController *controller in list) {
         GCExtendedGamepad *pad = controller.extendedGamepad;
         if (!pad) continue;
+        int player = two_players() && seat++ > 0 ? 2 : 1;
+        if (two_players()) {
+            GCControllerPlayerIndex light = player == 1 ? GCControllerPlayerIndex1 : GCControllerPlayerIndex2;
+            if (controller.playerIndex != light) controller.playerIndex = light;
+        }
+        if (player == 2) {
+            second.connected = 1;
+            physical2 |= gamepad_buttons(pad, face_by_position(controller));
+            second.lx = stronger_axis(second.lx, stick_axis(pad.leftThumbstick.xAxis.value));
+            second.ly = stronger_axis(second.ly, stick_axis(pad.leftThumbstick.yAxis.value));
+            second.rx = stronger_axis(second.rx, stick_axis(pad.rightThumbstick.xAxis.value));
+            second.ry = stronger_axis(second.ry, stick_axis(pad.rightThumbstick.yAxis.value));
+            continue;
+        }
         next.connected = 1;
         physical |= gamepad_buttons(pad, face_by_position(controller));
         next.lx = stronger_axis(next.lx, stick_axis(pad.leftThumbstick.xAxis.value));
@@ -122,7 +158,16 @@ static void refresh_gamepads(void) {
     uint64_t held = physical & ~suppressed;
     for (int i = 0; i < CONTROLLER_BUTTONS; i++) if (controllerModes[i] != CONTROLLER_HOLD) held &= ~(1ULL << i);
     next.buttons |= controller_map_apply(controllerMap, held) | synthetic;
+    /* Player 2 uses the same layout for held buttons. Tap/toggle/aim modes are player 1's automation: they would be
+       latched from two independent controllers at once, so they do not apply to the second seat. */
+    uint64_t held2 = physical2;
+    for (int i = 0; i < CONTROLLER_BUTTONS; i++) if (controllerModes[i] != CONTROLLER_HOLD) held2 &= ~(1ULL << i);
+    second.buttons = controller_map_apply(controllerMap, held2);
     pthread_mutex_lock(&gamepadLock);
+    if (second.connected != player2State.connected)
+        fprintf(stderr, "[totk-input] player 2 %s\n", second.connected ? "connected: the second controller" : "disconnected");
+    player2Edges |= second.buttons & ~player2State.buttons;
+    player2State = second;
     pressedEdges |= next.buttons & ~gamepadState.buttons;
     gamepadState = next;
     pthread_mutex_unlock(&gamepadLock);
@@ -131,6 +176,7 @@ static void refresh_gamepads(void) {
 static void attach_gamepad(GCController *controller) {
     GCExtendedGamepad *pad = controller.extendedGamepad;
     if (!pad) return;
+    add_controller(controller);
     pad.valueChangedHandler = ^(GCExtendedGamepad *changed, GCControllerElement *element) {
         (void)changed; (void)element;
         refresh_gamepads();
@@ -145,6 +191,7 @@ static void attach_gamepad(GCController *controller) {
 void runtime_gamepad_start(void) {
     if (started) return;
     started = YES;
+    if (!controllers) controllers = [NSMutableArray array];
     load_controller_map();
     NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
     [center addObserverForName:GCControllerDidConnectNotification object:nil queue:NSOperationQueue.mainQueue
@@ -154,6 +201,7 @@ void runtime_gamepad_start(void) {
                        GCController *controller = notification.object;
                        fprintf(stderr, "[totk-input] native gamepad disconnected: %s\n",
                                (controller.vendorName ?: @"unknown").UTF8String);
+                       [controllers removeObject:controller];
                        runtime_feedback_detach(controller);
                        refresh_gamepads();
                    }];
@@ -169,7 +217,26 @@ void runtime_gamepad_clear(void) {
     memset(toggleMoved, 0, sizeof toggleMoved);
     pthread_mutex_lock(&gamepadLock);
     gamepadState = (RuntimeGamepadState){0};
+    player2State.buttons = 0; player2Edges = 0;
     pressedEdges = 0;
+    pthread_mutex_unlock(&gamepadLock);
+}
+
+void runtime_gamepad_clear_player1(void) {
+    physicalPrev = 0;
+    memset(tapUntil, 0, sizeof tapUntil);
+    memset(toggleOn, 0, sizeof toggleOn);
+    memset(toggleMoved, 0, sizeof toggleMoved);
+    pthread_mutex_lock(&gamepadLock);
+    gamepadState.buttons = 0;
+    pressedEdges = 0;
+    pthread_mutex_unlock(&gamepadLock);
+}
+
+void runtime_gamepad_clear_player2(void) {
+    pthread_mutex_lock(&gamepadLock);
+    player2State.buttons = 0;
+    player2Edges = 0;
     pthread_mutex_unlock(&gamepadLock);
 }
 
@@ -182,6 +249,21 @@ void runtime_touch_pad_set(const RuntimeGamepadState *s) {
     pressedEdges |= s->buttons & ~touchState.buttons;
     touchState = *s;
     pthread_mutex_unlock(&gamepadLock);
+}
+
+void runtime_gamepad_read_player2(RuntimeGamepadState *out) {
+    pthread_mutex_lock(&gamepadLock);
+    *out = player2State;
+    out->buttons |= player2Edges;
+    player2Edges = 0;
+    pthread_mutex_unlock(&gamepadLock);
+}
+
+int runtime_gamepad_player2_connected(void) {
+    pthread_mutex_lock(&gamepadLock);
+    int connected = player2State.connected;
+    pthread_mutex_unlock(&gamepadLock);
+    return connected;
 }
 
 void runtime_gamepad_read(RuntimeGamepadState *out) {
